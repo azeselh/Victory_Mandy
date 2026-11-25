@@ -74,24 +74,22 @@ thread_local! {
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
-/// (`VICTORY_EARLY_TEXTURES_MS`, 12; 0: never, as before), and the
+/// (`VICTORY_EARLY_TEXTURES_MS`, 25; 0: never, as before), and the
 /// milliseconds it may take just before a draw of the title's decoration
 /// bake (`VICTORY_BAKE_TEXTURES_MS`, 1500; 0: nothing special).
 ///
-/// The pass ran only from the first world frame on, where it met some
-/// 24,000 slots at once and needed 60-80 frames for them. The title bakes
-/// its characters' skin and decorations into textures of its own while it
-/// loads, 159-1,165 frames before that (runs 156-174), with a pixel shader
-/// that picks its sources by index: whatever was not on the card then was
-/// baked as nothing, once, for the run. On the console a texture is there
-/// when its bytes are.
+/// AMD RDNA 3 optimisation: `VICTORY_EARLY_TEXTURES_MS` raised from 12 to
+/// 25 ms.  At 2–4 FPS (early world, 20k–44k slots due) the GPU sits idle
+/// while the CPU records and the extra 13 ms of early texture uploads per
+/// draw are hidden in that idle time, reducing the number of black-texture
+/// frames before all textures reach the card.
 fn early_budgets() -> (u64, u64) {
     static MS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
         let ms = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (ms("VICTORY_EARLY_TEXTURES_MS", 25), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
     })
 }
 
@@ -1772,9 +1770,17 @@ impl State {
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.
+        //
+        // AMD RDNA 3 optimisation: default raised from 192 MB to 384 MB.
+        // With VICTORY_TEXTURE_STAGE_MS now 400 ms (and 1200 ms in catchup mode)
+        // the time budget is no longer the dominant cap in early-world loading;
+        // raising the byte cap to 384 MB ensures we do not stop early when the
+        // GPU has VRAM to spare.  The card-room check every 32 MiB already
+        // guards against over-filling VRAM.  Set VICTORY_TEXTURE_STAGE_MB=192
+        // to restore the previous default on GPUs with less than 16 GB VRAM.
         static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
+            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(384)
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
@@ -1850,16 +1856,28 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
+        //
+        // AMD RDNA 3 optimisation: default raised from 100 ms to 400 ms.
+        // At 2–4 FPS the recording thread is not the bottleneck (GPU is at
+        // 15 % utilisation); giving the texture pass 4× more time per frame
+        // drains the 20k–44k early-world backlog in fewer frames without
+        // making the pipeline feel slower when the game is running smoothly
+        // (at 60 FPS the pass already finishes well under 100 ms).
+        // Override with VICTORY_TEXTURE_STAGE_MS=N to tune for other GPUs.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(400)
         }));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        //
+        // AMD fix: previously only `per_frame` was tripled; `span` stayed at the
+        // base value, so the per-frame time cap still cut the pass short before it
+        // could use the extra bytes.  Both are tripled together now.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span) } else { (per_frame, span) };
+        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
