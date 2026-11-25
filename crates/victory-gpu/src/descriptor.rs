@@ -96,7 +96,11 @@ impl Heap {
                 let step = u64::from(increment(self.desc.kind)?);
                 let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
                 for i in pending.drain(..) {
+<<<<<<< Updated upstream
                     h.mirror(i, self.start + u64::from(i) * step, false);
+=======
+                    h.mirror_if_stale(i, self.start + u64::from(i) * step, false);
+>>>>>>> Stashed changes
                 }
                 Some(h)
             })
@@ -164,7 +168,11 @@ fn mirror(handle: u64) {
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
+<<<<<<< Updated upstream
                 host.mirror(index, handle, false);
+=======
+                host.mirror_if_stale(index, handle, false);
+>>>>>>> Stashed changes
             }
         }
     }
@@ -848,7 +856,11 @@ pub(crate) fn make_waiting() {
                 _ => false,
             };
             if same && let Some(Some(host)) = heap.host.get() {
+<<<<<<< Updated upstream
                 host.mirror(index, handle, true);
+=======
+                host.mirror_if_stale(index, handle, true);
+>>>>>>> Stashed changes
             }
         }
     }
@@ -907,6 +919,63 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
+<<<<<<< Updated upstream
+=======
+/// Checks whether record `(i, generation)` still resolves to a valid view without
+/// cloning it (taking `VIEWS` only when needed).
+fn view_exists_at(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        0 => views_read()
+            .list
+            .get(i as usize)
+            .is_some_and(|(_, current)| *current == generation),
+        CONSTANT => true,
+        PLACED => views_read().placed_of(i, generation).is_some(),
+        _ => false,
+    }
+}
+
+/// Resolves a batch of raw record headers `[tag, i, generation]` into views,
+/// taking the `VIEWS` read lock at most once for the whole batch.
+fn views_at_batch(records: &[[u32; 3]], out: &mut Vec<Option<View>>) {
+    out.clear();
+    out.resize_with(records.len(), || None);
+    let mut needs_lock = false;
+    for (idx, &[tag, i, generation]) in records.iter().enumerate() {
+        if tag != VIEW_TAG {
+            continue;
+        }
+        if generation >> KIND_SHIFT == CONSTANT {
+            out[idx] = Some(constant_of(i, generation));
+        } else {
+            needs_lock = true;
+        }
+    }
+    if !needs_lock {
+        return;
+    }
+    let views = views_read();
+    for (idx, &[tag, i, generation]) in records.iter().enumerate() {
+        if tag != VIEW_TAG {
+            continue;
+        }
+        match generation >> KIND_SHIFT {
+            0 => {
+                if let Some((view, current)) = views.list.get(i as usize)
+                    && *current == generation
+                {
+                    out[idx] = Some(view.clone());
+                }
+            }
+            PLACED => {
+                out[idx] = views.placed_of(i, generation);
+            }
+            _ => {}
+        }
+    }
+}
+
+>>>>>>> Stashed changes
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {

@@ -1,6 +1,3 @@
-[README NOT UPDATED YET]
-
-
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
@@ -46,6 +43,88 @@ developer or publisher.
   and resource-heap typed/structured buffer counts come from the host slot
   table instead of `getDimensions` to avoid AMD driver compiler stalls and
   crashes.
+
+## Mejoras locales AMD Enhanced (`amd-enhanced-v2`, Radeon RX 7900 XT)
+
+Esta sección documenta los cambios realizados sobre `victory-fork` tras fusionar
+`origin/main` en la rama `amd-enhanced-v2`, orientados a reducir contención de
+bloqueos, escaneos repetidos y esperas síncronas en CPU/GPU sobre hardware AMD
+Radeon RX 7900 XT (driver `32.0.32029.2010`, Windows 11, Core i5-13400F).
+
+### Cambios aplicados en el código fuente
+
+1. **Resolución y espejado por lotes de descriptores (`descriptor.rs`, `descriptor/host.rs`)**:
+   - Se añadió `views_at_batch` en [crates/victory-gpu/src/descriptor.rs](crates/victory-gpu/src/descriptor.rs)
+     para resolver descriptores `CONSTANT` sin adquirir candados y agrupar las
+     consultas de vistas en tabla/`PLACED` bajo una sola lectura de `VIEWS`, en
+     lugar de adquirir y liberar el `RwLock` en cada slot.
+   - Se añadieron `HostHeap::apply_mirror_batch` y `HostHeap::mirror_buffer_batch`
+     en [crates/victory-gpu/src/descriptor/host.rs](crates/victory-gpu/src/descriptor/host.rs),
+     y se adaptó `mirror_copied_page` para espejar páginas modificadas del heap
+     de descriptores en un único lote en vez de invocar `HostHeap::mirror`
+     slot por slot.
+   - Verificado con `cargo test -p victory-gpu --lib descriptor::` (31 tests
+     pasados, 0 fallidos).
+
+2. **Banderas atómicas conservadoras por slot (`HostHeap::slot_flags`)**:
+   - En [crates/victory-gpu/src/descriptor/host.rs](crates/victory-gpu/src/descriptor/host.rs)
+     se incorporó `slot_flags: Vec<AtomicU8>` (`FLAG_TEXTURE`, `FLAG_PLACED`,
+     `FLAG_BUFFER`) para evitar adquirir innecesariamente los mutex de `textures`,
+     `placed` y `buffers` cuando un slot no tiene estado asociado de ese tipo.
+
+3. **Barrido incremental de buffers del heap (`State::heap_buffers` y `buffer_slots_bucket`)**:
+   - Se implementó `HostHeap::buffer_slots_bucket` y se modificó
+     `State::heap_buffers` en [crates/victory-gpu/src/draw.rs](crates/victory-gpu/src/draw.rs)
+     para procesar los cambios recientes (`buffer_changes()`) junto con únicamente
+     1/16 de los slots de buffer por pasada (`passes % 16`) usando
+     `mirror_buffer_batch`, eliminando los picos periódicos por reescaneo
+     completo de decenas de miles de slots.
+
+4. **Cola de texturas y límites de staging CPU (`TextureQueue::due_and_census`, `Start-Victory-AMD.ps1`)**:
+   - `TextureQueue::due_and_census` recorre la cola en una sola pasada con
+     vectores preasignados.
+   - En [tools/Start-Victory-AMD.ps1](tools/Start-Victory-AMD.ps1) se mantienen
+     los topes de staging por frame (`VICTORY_TEXTURE_STAGE_MS=100`,
+     `VICTORY_TEXTURE_STAGE_MB=192`, `VICTORY_EARLY_TEXTURES_MS=12`) para no
+     congelar el hilo de grabación CPU al acumularse carga de texturas, junto con
+     suporte de lanzamiento directo y perfilado (`-Diagnostics`).
+
+5. **Experimento revertido (`xmem.rs` / `VICTORY_MAP_BATCH`)**:
+   - Se evaluó la coalescencia de mapeos scatter/alias en
+     [crates/victory-hle/src/modules/xmem.rs](crates/victory-hle/src/modules/xmem.rs),
+     pero se **revirtió** al código base (`cargo test -p victory-hle --lib modules::xmem::tests`:
+     12 pasados, 0 fallidos): en pruebas diagnósticas reales produjo error 487
+     (`MEM_COALESCE_PLACEHOLDERS`) y cierre de Breakpad (~58 s) porque
+     `UnmapViewOfFile2` desmapeaba vistas multipágina completas mientras otros
+     hilos del juego accedían a páginas vecinas del pool. Sin esa coalescencia el
+     juego supera el frame 2401 sin cierres.
+
+### Hallazgos de perfilado diagnóstico en curso (`target\diag\victory.exe`)
+
+> Nota: estas mediciones provienen de compilaciones **Diagnostics**
+> (`VICTORY_PROFILE=1`, captura periódica de frames) y sirven para localizar
+> cuellos de botella, no deben confundirse con el rendimiento final de **Release**.
+
+- **Impacto de `VICTORY_LATE_WAIT=1` frente a etapa 3 automática (`VICTORY_RELAY=2` sin forzar `1`)**:
+  - Forzar `VICTORY_LATE_WAIT=1` degradaba el renderizado del mundo a **3,1–3,3 fps**
+    (299–318 ms/frame en ~5.070–5.096 draws), con **128,6 ms/frame** detenidos en
+    `settle` (principalmente esperas síncronas por escrituras y `Present`).
+  - Al no forzar etapa 1 (etapa 3 activa con `VICTORY_RELAY=2`), la espera en
+    `settle` bajó a **45,8 ms/frame** (`Present` síncrono a 0,0 ms), alcanzando
+    **5,7–6,6 fps** (151,6–174,4 ms/frame) en vistas de ~3.107–3.218 draws.
+- **Pruebas con espejado por lotes y `VICTORY_ASYNC_PRESENT=1`**:
+  - La contención de `HostHeap::mirror` en hilos auxiliares desapareció (0,15 ms),
+    `apply_mirror_batch` redujo el coste en envío (~7–8 ms sin saturación) y con
+    `VICTORY_ASYNC_PRESENT=1` la espera de `Present` en el hilo de render cayó a
+    **0,0 ms** (picos de **8,6–8,7 fps** / 115–116 ms en tramos ligeros de
+    ~503–558 draws y **3,2–3,7 fps** / 270,6–312,2 ms en la escena pesada de
+    ~4.932–5.110 draws).
+  - El perfilado detectó el siguiente cuello de botella activo en el solapamiento:
+    contención en el mutex de `HostHeap::mirror` desde los hilos de grabación
+    (`State::tables` / `State::table_entry`, hasta 23 ms en normal y 358 ms
+    acumulados al solapar `Present`), además del coste en GPU de pases de hash
+    sin unir (`VICTORY_CARD_REHASH_RUNS`) y clamps indirectos por draw
+    (`VICTORY_INDIRECT_WINDOW`), actualmente bajo optimización y medición A/B.
 
 ## Status of this fork (2026-11-25)
 

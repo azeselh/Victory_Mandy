@@ -1,5 +1,10 @@
+<<<<<<< Updated upstream
 ﻿# Start-Victory-AMD.ps1 — Optimised launcher for AMD Radeon RX 7900 XT (RDNA 3)
 # Branch: amd-enhanced-v2  |  Commit: a67a77b (AMD RDNA3 texture pipeline opt.)
+=======
+# Start-Victory-AMD.ps1 — Optimised launcher for AMD Radeon RX 7900 XT (RDNA 3)
+# Branch: amd-enhanced-v2
+>>>>>>> Stashed changes
 #
 # USAGE:
 #   .\tools\Start-Victory-AMD.ps1 -TitleExecutable "C:\...\game_scarlett_master.exe"
@@ -9,6 +14,7 @@
 # ENVIRONMENT VARIABLES SET:
 #   VICTORY_LATE_WAIT=1       Async command submission (up to 256 in flight)
 #   VICTORY_RELAY=2           Copy-back on its own thread + copy queue for card fetches
+<<<<<<< Updated upstream
 #   VICTORY_TEXTURE_STAGE_MS  400 ms default (overridden by this script if set)
 #   VICTORY_TEXTURE_STAGE_MB  384 MB default (overridden by this script if set)
 #   VICTORY_EARLY_TEXTURES_MS 25 ms default (overridden by this script if set)
@@ -18,6 +24,16 @@
 #
 # To revert texture defaults to upstream values:
 #   $env:VICTORY_TEXTURE_STAGE_MS=100; $env:VICTORY_TEXTURE_STAGE_MB=192; $env:VICTORY_EARLY_TEXTURES_MS=12
+=======
+#   VICTORY_TEXTURE_STAGE_MS  100 ms default (preserves an existing override)
+#   VICTORY_TEXTURE_STAGE_MB  192 MB default (preserves an existing override)
+#   VICTORY_EARLY_TEXTURES_MS 12 ms default (preserves an existing override)
+#
+# To profile a run with diagnostics:
+#   cargo build --profile diag -p victory --features diagnostics
+#   .\tools\Start-Victory-AMD.ps1 -Diagnostics
+# With -Executable, supply a binary built with the diagnostics feature.
+>>>>>>> Stashed changes
 
 param(
     [string]$TitleExecutable,
@@ -30,7 +46,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath("$PSScriptRoot/..")
+<<<<<<< Updated upstream
 $exe  = (Resolve-Path -LiteralPath $Executable).Path
+=======
+if ($Diagnostics -and -not $PSBoundParameters.ContainsKey('Executable')) {
+    $Executable = "$repo/target/diag/victory.exe"
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+        throw 'Build diagnostics first: cargo build --profile diag -p victory --features diagnostics'
+    }
+}
+$exe  = (Resolve-Path -LiteralPath $Executable).Path
+$diagnosticLog = $null
+>>>>>>> Stashed changes
 
 # ── AMD-specific environment ──────────────────────────────────────────────────
 # Async command submission: reduces CPU blocking on Present/ExecuteCommandLists.
@@ -40,6 +67,7 @@ $env:VICTORY_LATE_WAIT = '1'
 # VICTORY_RELAY=2 is the best mode on AMD (copy queue avoids graphics-queue stalls).
 $env:VICTORY_RELAY = '2'
 
+<<<<<<< Updated upstream
 # Texture upload pipeline — tuned for RDNA 3 / RX 7900 XT with 20 GB VRAM.
 # At 2–4 FPS early-world the recording thread is idle most of the frame; giving
 # heap_textures more time & bytes drains the 20k–44k slot backlog faster.
@@ -48,6 +76,13 @@ $env:VICTORY_RELAY = '2'
 if (-not $env:VICTORY_TEXTURE_STAGE_MS) { $env:VICTORY_TEXTURE_STAGE_MS = '400' }
 if (-not $env:VICTORY_TEXTURE_STAGE_MB) { $env:VICTORY_TEXTURE_STAGE_MB = '384' }
 if (-not $env:VICTORY_EARLY_TEXTURES_MS) { $env:VICTORY_EARLY_TEXTURES_MS = '25' }
+=======
+# Texture staging runs on the CPU recording thread. More VRAM does not
+# hide its cost: keep the ordinary time cap even when a backlog builds up.
+if (-not $env:VICTORY_TEXTURE_STAGE_MS) { $env:VICTORY_TEXTURE_STAGE_MS = '100' }
+if (-not $env:VICTORY_TEXTURE_STAGE_MB) { $env:VICTORY_TEXTURE_STAGE_MB = '192' }
+if (-not $env:VICTORY_EARLY_TEXTURES_MS) { $env:VICTORY_EARLY_TEXTURES_MS = '12' }
+>>>>>>> Stashed changes
 
 # Wide merge: parallel merge of card-compare results (off by default; try =1
 # if you have a fast CPU with many cores and the merge pass shows up in logs).
@@ -55,8 +90,16 @@ if (-not $env:VICTORY_EARLY_TEXTURES_MS) { $env:VICTORY_EARLY_TEXTURES_MS = '25'
 
 # Diagnostics mode: collect per-frame timing into %LOCALAPPDATA%\victory\diagnostics\
 if ($Diagnostics) {
+<<<<<<< Updated upstream
     $env:RUST_LOG = 'victory=debug'
     Write-Host '[AMD] Diagnostics mode on — logs will appear in %LOCALAPPDATA%\victory\diagnostics\' -ForegroundColor Cyan
+=======
+    $env:VICTORY_LOG = 'info'
+    $run = Join-Path "$env:LOCALAPPDATA/victory/diagnostics" ((Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $run | Out-Null
+    $diagnosticLog = Join-Path $run 'stderr.log'
+    Write-Host '[AMD] Diagnostics log:' $diagnosticLog -ForegroundColor Cyan
+>>>>>>> Stashed changes
 }
 
 Write-Host '[AMD] VICTORY_LATE_WAIT  =' $env:VICTORY_LATE_WAIT  -ForegroundColor Green
@@ -70,7 +113,15 @@ function Invoke-Victory([string[]]$Arguments) {
     $previous = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
+<<<<<<< Updated upstream
         & $exe @Arguments
+=======
+        if ($diagnosticLog) {
+            & $exe @Arguments 2>> $diagnosticLog
+        } else {
+            & $exe @Arguments
+        }
+>>>>>>> Stashed changes
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
