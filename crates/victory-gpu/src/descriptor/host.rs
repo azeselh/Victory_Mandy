@@ -1660,6 +1660,7 @@ impl HostHeap {
 
     /// The title slots that hold buffer views.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         buffers.iter().copied().collect()

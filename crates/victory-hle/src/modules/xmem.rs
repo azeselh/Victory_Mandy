@@ -393,25 +393,6 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     })
 });
 
-impl Physical {
-    /// Windows unmaps every intersected view in full, even when unmapping
-    /// one page in its middle. Caller holds PHYSICAL until remapping ends.
-    fn unmap_extent(&self, base: usize, end: usize) -> std::ops::Range<usize> {
-        let start = self
-            .views
-            .range(..=base)
-            .next_back()
-            .filter(|(at, (size, _))| *at + size > base)
-            .map_or(base, |(&at, _)| at);
-        let end = self
-            .views
-            .range(..end)
-            .next_back()
-            .map_or(end, |(&at, (size, _))| end.max(at + size));
-        start..end
-    }
-}
-
 fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -688,22 +669,13 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
-    if n == 0 {
-        return address;
-    }
-    let Some(len) = n.checked_mul(PAGE) else {
-        return std::ptr::null_mut();
-    };
-    let Some(end) = base.checked_add(len) else {
-        return std::ptr::null_mut();
-    };
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping_range`).
-    let _changing = victory_gpu::title_memory_remapping_range(physical.unmap_extent(base, end));
-    unmap(&mut physical, base, len);
+    // into that gap (`victory_gpu::title_memory_remapping`).
+    let _changing = victory_gpu::title_memory_remapping();
+    unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
     }
@@ -769,23 +741,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
-    if len == 0 {
-        return true;
-    }
-    let span = if from == 0 {
-        Some(len)
-    } else {
-        len.checked_next_multiple_of(PAGE)
-    };
-    let Some(end) = span.and_then(|span| to.checked_add(span)) else {
-        return false;
-    };
-    if from.checked_add(len).is_none() {
-        return false;
-    }
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping_range(physical.unmap_extent(to, end));
+    let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1292,15 +1250,13 @@ mod tests {
         // SAFETY: mapped read-write.
         unsafe { a.cast::<u8>().write(1) };
         let first = a as usize;
-        let middle = first + PAGE;
-        assert_eq!(physical().unmap_extent(middle, middle + PAGE), first..first + 3 * PAGE);
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let reader = {
             let stop = stop.clone();
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let _reading = victory_gpu::title_memory_reading_range(first..first + 1);
+                    let _reading = victory_gpu::title_memory_reading();
                     // SAFETY: the page is mapped whenever no change of
                     // mapping is under way, and none is while `_reading`
                     // is held.
@@ -1317,22 +1273,6 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         assert!(reader.join().expect("the reader never faulted") > 0);
-        // Replacing just the middle page still takes the first page away.
-        // This real Windows mapping must wait for a reader on that first page.
-        let first_page = victory_gpu::title_memory_reading_range(first..first + 1);
-        let (started, starting) = std::sync::mpsc::channel();
-        let (done, ended) = std::sync::mpsc::channel();
-        let page = pages[1];
-        let writer = std::thread::spawn(move || {
-            started.send(()).unwrap();
-            let result = XMemMapPhysicalPages(middle as _, 1, &page) as usize;
-            done.send(result).unwrap();
-        });
-        starting.recv().unwrap();
-        assert!(ended.recv_timeout(std::time::Duration::from_millis(100)).is_err());
-        drop(first_page);
-        assert_eq!(ended.recv().unwrap(), middle);
-        writer.join().unwrap();
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }

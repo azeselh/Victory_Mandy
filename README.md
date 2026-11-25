@@ -80,51 +80,63 @@ Radeon RX 7900 XT (driver `32.0.32029.2010`, Windows 11, Core i5-13400F).
      `mirror_buffer_batch`, eliminando los picos periódicos por reescaneo
      completo de decenas de miles de slots.
 
-4. **Cola de texturas y límites de staging CPU (`TextureQueue::due_and_census`, `Start-Victory-AMD.ps1`)**:
+4. **Cola de texturas y lanzador AMD ([Start-Victory-AMD.ps1](tools/Start-Victory-AMD.ps1))**:
    - `TextureQueue::due_and_census` recorre la cola en una sola pasada con
      vectores preasignados.
    - En [tools/Start-Victory-AMD.ps1](tools/Start-Victory-AMD.ps1) se mantienen
      los topes de staging por frame (`VICTORY_TEXTURE_STAGE_MS=100`,
-     `VICTORY_TEXTURE_STAGE_MB=192`, `VICTORY_EARLY_TEXTURES_MS=12`) para no
-     congelar el hilo de grabación CPU al acumularse carga de texturas, junto con
-     suporte de lanzamiento directo y perfilado (`-Diagnostics`).
+     `VICTORY_TEXTURE_STAGE_MB=192`, `VICTORY_EARLY_TEXTURES_MS=12`), se elimina
+     el forzado de `VICTORY_LATE_WAIT=1` para que `VICTORY_RELAY=2` active la
+     etapa 3 automáticamente, y se activa `VICTORY_COPY_PLAIN=1` por defecto.
+     Mantiene soporte de perfilado con `-Diagnostics`.
 
-5. **Experimento revertido (`xmem.rs` / `VICTORY_MAP_BATCH`)**:
-   - Se evaluó la coalescencia de mapeos scatter/alias en
-     [crates/victory-hle/src/modules/xmem.rs](crates/victory-hle/src/modules/xmem.rs),
-     pero se **revirtió** al código base (`cargo test -p victory-hle --lib modules::xmem::tests`:
-     12 pasados, 0 fallidos): en pruebas diagnósticas reales produjo error 487
-     (`MEM_COALESCE_PLACEHOLDERS`) y cierre de Breakpad (~58 s) porque
-     `UnmapViewOfFile2` desmapeaba vistas multipágina completas mientras otros
-     hilos del juego accedían a páginas vecinas del pool. Sin esa coalescencia el
-     juego supera el frame 2401 sin cierres.
+5. **Ruta rápida sin candados en `HostHeap::mirror` (`made_keys`, `mirror_if_stale`, `warm_view_resource`)**:
+   - En [crates/victory-gpu/src/descriptor/host.rs](crates/victory-gpu/src/descriptor/host.rs)
+     y [crates/victory-gpu/src/descriptor.rs](crates/victory-gpu/src/descriptor.rs)
+     se añadió `made_keys: Vec<AtomicU64>` (espejo atómico de `made`) y
+     `view_exists_at` para resolver slots sin cambios sin adquirir `self.made` ni
+     clonar `View` en `State::tables` (`draw.rs`).
+   - Se añadió `warm_view_resource` en `HostHeap::mirror` y
+     `apply_mirror_batch` para crear/calentar las texturas D3D12 fuera del
+     mutex `self.made`, evitando bloquear otros hilos de grabación y envío
+     durante llamadas a `ID3D12Device::CreateCommittedResource`.
+   - En los perfiles de grabación (`RECORDING`), la espera en `HostHeap::mirror`
+     se redujo de **358,27 ms (12,2 %)** a **78,97–135,08 ms (3,6–4,1 %)** y
+     en `apply_mirror_batch` de **31,75 ms** a **6,10–16,97 ms**.
 
-### Hallazgos de perfilado diagnóstico en curso (`target\diag\victory.exe`)
+6. **Preparación paralela opcional de subidas y preludes (`host.rs`)**:
+   - Adaptado de [DexNom/VIctory](https://github.com/DexNom/VIctory): en
+     [crates/victory-gpu/src/host.rs](crates/victory-gpu/src/host.rs) se
+     incorporaron `Step::Fills` (`VICTORY_FILL_WORKERS`) sobre `shadow::wide_run`
+     y `PlannedPrelude` (`VICTORY_PARALLEL_PRELUDES=1`), desactivados por
+     defecto (`1` / `0`) al no mostrar mejora neta sobre el hilo único en las
+     mediciones locales.
 
-> Nota: estas mediciones provienen de compilaciones **Diagnostics**
-> (`VICTORY_PROFILE=1`, captura periódica de frames) y sirven para localizar
-> cuellos de botella, no deben confundirse con el rendimiento final de **Release**.
+7. **Experimentos evaluados y revertidos o descartados**:
+   - **`xmem.rs` / `VICTORY_MAP_BATCH=1` (revertido)**: la coalescencia
+     multipágina provocaba error 487 (`MEM_COALESCE_PLACEHOLDERS`) y cierre de
+     Breakpad (~58 s) al desmapear vistas mientras otros hilos accedían a páginas
+     vecinas del pool.
+   - **Bloqueo por rango de direcciones (`DexNom 5f4c3df` en `watch.rs` / `xmem.rs` / `texture.rs`, revertido)**:
+     en RX 7900 XT + i5-13400F, el doble mutex + condvar sobre `XMemMapPhysicalPagesScatter`
+     elevó `ZwUnmapViewOfSectionEx` de **19 ms a 413,5 ms** y disparó el
+     staging de texturas (340–541 ms), cayendo de 4,3–5,1 fps (`210 ms`) a
+     3,2–3,5 fps (`268 ms`). Se conservó el `RwLock` original.
 
-- **Impacto de `VICTORY_LATE_WAIT=1` frente a etapa 3 automática (`VICTORY_RELAY=2` sin forzar `1`)**:
-  - Forzar `VICTORY_LATE_WAIT=1` degradaba el renderizado del mundo a **3,1–3,3 fps**
-    (299–318 ms/frame en ~5.070–5.096 draws), con **128,6 ms/frame** detenidos en
-    `settle` (principalmente esperas síncronas por escrituras y `Present`).
-  - Al no forzar etapa 1 (etapa 3 activa con `VICTORY_RELAY=2`), la espera en
-    `settle` bajó a **45,8 ms/frame** (`Present` síncrono a 0,0 ms), alcanzando
-    **5,7–6,6 fps** (151,6–174,4 ms/frame) en vistas de ~3.107–3.218 draws.
-- **Pruebas con espejado por lotes y `VICTORY_ASYNC_PRESENT=1`**:
-  - La contención de `HostHeap::mirror` en hilos auxiliares desapareció (0,15 ms),
-    `apply_mirror_batch` redujo el coste en envío (~7–8 ms sin saturación) y con
-    `VICTORY_ASYNC_PRESENT=1` la espera de `Present` en el hilo de render cayó a
-    **0,0 ms** (picos de **8,6–8,7 fps** / 115–116 ms en tramos ligeros de
-    ~503–558 draws y **3,2–3,7 fps** / 270,6–312,2 ms en la escena pesada de
-    ~4.932–5.110 draws).
-  - El perfilado detectó el siguiente cuello de botella activo en el solapamiento:
-    contención en el mutex de `HostHeap::mirror` desde los hilos de grabación
-    (`State::tables` / `State::table_entry`, hasta 23 ms en normal y 358 ms
-    acumulados al solapar `Present`), además del coste en GPU de pases de hash
-    sin unir (`VICTORY_CARD_REHASH_RUNS`) y clamps indirectos por draw
-    (`VICTORY_INDIRECT_WINDOW`), actualmente bajo optimización y medición A/B.
+### Resultados medidos A/B (`target\diag\victory.exe`, escena pesada ~5.000 draws/frame)
+
+> Nota: mediciones en build **Diagnostics** (`VICTORY_PROFILE=1`, captura periódica
+> de frames); sirven para comparación controlada A/B, no representan el techo de **Release**.
+
+| Configuración | Draws/frame | FPS observados | `usual frame` | Estabilidad en 250–260 s |
+|---|---:|---:|---:|---|
+| Base (`VICTORY_LATE_WAIT=1`, `VICTORY_RELAY=2`) | ~5.067–5.096 | 2,8–3,3 fps | 306 ms | Estable (`settle` 128,6 ms) |
+| Etapa 3 (`VICTORY_RELAY=2`, sin `LATE_WAIT=1`, ~3.100 draws) | ~3.107–3.218 | 5,7–6,6 fps | 156 ms | Estable (`settle` 45,8 ms) |
+| Etapa 3 + `VICTORY_ASYNC_PRESENT=1` (antes de `made_keys`) | ~4.932–5.110 (503–558 pico) | 3,2–3,7 fps (pico 8,7) | 165 ms | Estable (`Present` 0,0 ms; alta contención previa en `mirror`) |
+| `VICTORY_RELAY=2` + `VICTORY_CARD_REHASH_RUNS=1` | ~5.070 | 1,5–1,9 fps | 476 ms | Fallo `0x887A0006` (~200 s); descartado |
+| `VICTORY_RELAY=2` + `VICTORY_INDIRECT_WINDOW=1` | ~4.988–5.005 | 3,9–4,2 fps | 254 ms | Estable aislado; con `COPY_PLAIN=1` sin DRED falló 1 vez (`0x887A0006` ~179 s) y con DRED pasó 260 s a 2,9–3,4 fps |
+| **`VICTORY_RELAY=2` + `VICTORY_COPY_PLAIN=1` (recomendado)** | **~4.996–5.084** | **4,3–5,1 fps** | **210 ms** | **Estable (0 errores de driver; `ZwReadVirtualMemory` 77,4 → 9,7 ms)** |
+| `DexNom` `range-lock` + `FILL_WORKERS=4` + `COPY_PLAIN=1` | ~4.642–4.668 | 3,2–3,5 fps | 268 ms | Regresión por remapeos y carga de texturas; `range-lock` revertido |
 
 ## Status of this fork (2026-11-25)
 
