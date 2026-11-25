@@ -43,13 +43,41 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
+        .filter_map(|offset| {
+            let bytes = &data[offset..];
+            Container::parse(bytes).ok()?;
+            // Runtime bytecode ends at the container boundary. Including
+            // the rest of an executable changes both its hash and cache key.
+            let size = u32::from_le_bytes(bytes[0x18..0x1c].try_into().ok()?) as usize;
+            Some(Source::Raw { offset, data: &bytes[..size] })
         });
     out.extend(raw);
     out
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_containers_have_the_same_bytes_and_hash_as_runtime_bytecode() {
+        let mut container = vec![0; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[0x14] = 1;
+        container[0x18..0x1c].copy_from_slice(&32u32.to_le_bytes());
+        let mut file = b"synthetic prefix".to_vec();
+        file.extend_from_slice(&container);
+        file.extend_from_slice(b"padding");
+        file.extend_from_slice(&container);
+        file.extend_from_slice(b"trailing bytes and a truncated DXBC");
+        let found = sources(&file);
+        assert_eq!(found.len(), 2);
+        for source in found {
+            let bytes = source.bytes().unwrap();
+            assert_eq!(bytes.as_ref(), container);
+            assert_eq!(blake3::hash(&bytes), blake3::hash(&container));
+        }
+    }
 }
 
 #[derive(Default)]

@@ -1783,4 +1783,23 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    #[test]
+    fn pixel_readfirstlane_validates_with_dxil() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0x7E00_0500, // v_readfirstlane_b32 s0, v0
+            0x7E04_0200, // v_mov_b32 v2, s0
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        validate(&shader);
+        if let Ok(h) = host::Host::new(false) {
+            let vs = host::stub_vs(&shader).unwrap();
+            h.pipeline(&vs, &shader)
+                .expect("host creates graphics PSO for pixel shader with isHelperLane.i1");
+        }
+    }
 }

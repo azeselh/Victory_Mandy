@@ -92,6 +92,15 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// Fullscreen draws can initialise lighting tables only once. Give
+    /// their pipelines a separate compilation queue (Belobug 18e57db).
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -589,7 +598,7 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    tracing::warn!(error = %e, ?shaders, depth_bounds, %state, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -634,7 +643,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: sanitize_blend_for_targets(g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -852,6 +861,57 @@ fn graphics_depth_bounds_pipeline(
 /// "already exists"). The translation makes triangle mesh shaders only
 /// (`mesh_prologue` refuses others), and the debug layer wants the two to
 /// agree (1323).
+fn is_integer_format(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+/// Clears `BlendEnable` and `LogicOpEnable` for integer (`_UINT` / `_SINT`)
+/// render targets: D3D12 rejects `CreatePipelineState` (`E_INVALIDARG`) if
+/// blending is enabled on an integer render target format.
+fn sanitize_blend_for_targets(
+    mut blend: D3D12_BLEND_DESC,
+    targets: &D3D12_RT_FORMAT_ARRAY,
+) -> D3D12_BLEND_DESC {
+    let n = (targets.NumRenderTargets as usize).min(8);
+    for i in 0..n {
+        if is_integer_format(targets.RTFormats[i]) {
+            if !blend.IndependentBlendEnable.as_bool() && i > 0 {
+                let zero = blend.RenderTarget[0];
+                for j in 1..n {
+                    blend.RenderTarget[j] = zero;
+                }
+                blend.IndependentBlendEnable = true.into();
+            }
+            blend.RenderTarget[i].BlendEnable = false.into();
+            blend.RenderTarget[i].LogicOpEnable = false.into();
+        }
+    }
+    blend
+}
+
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
@@ -862,6 +922,7 @@ fn mesh_pipeline(
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
+    let blend = sanitize_blend_for_targets(g.blend, &g.targets);
     #[repr(C)]
     struct Stream<D> {
         root: Sub<*mut std::ffi::c_void>,
@@ -881,7 +942,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -900,7 +961,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -981,6 +1042,27 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn screen_passes_exclude_geometry_and_depth_draws() {
+        let mut state = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
+        assert!(state.screen_pass());
+        state.depth_format = DXGI_FORMAT_D32_FLOAT;
+        assert!(!state.screen_pass());
+        state.depth.DepthEnable = false.into();
+        assert!(state.screen_pass());
+        state.depth.StencilEnable = true.into();
+        assert!(!state.screen_pass());
+        state.depth.StencilEnable = false.into();
+        state.inputs.push(D3D12_INPUT_ELEMENT_DESC::default());
+        assert!(!state.screen_pass());
+        state.inputs.clear();
+        state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        assert!(!state.screen_pass());
+    }
+
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
@@ -1060,6 +1142,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sanitize_blend_clears_integer_rt_blending() {
+        let mut targets = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 3, ..Default::default() };
+        targets.RTFormats[0] = DXGI_FORMAT_R32_FLOAT;
+        targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].BlendEnable = true.into();
+        let out = super::sanitize_blend_for_targets(blend, &targets);
+        assert!(out.IndependentBlendEnable.as_bool());
+        assert!(out.RenderTarget[0].BlendEnable.as_bool());
+        assert!(out.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!out.RenderTarget[2].BlendEnable.as_bool());
+        assert!(!out.RenderTarget[2].LogicOpEnable.as_bool());
+    }
+
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
         float2 p = float2((i << 1) & 2, i & 2);
         return float4(p * 2.0 - 1.0, 0.5, 1.0);
@@ -1115,7 +1213,7 @@ mod tests {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(&vs),
             PS: code(&ps),
-            BlendState: g.blend,
+            BlendState: sanitize_blend_for_targets(g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,

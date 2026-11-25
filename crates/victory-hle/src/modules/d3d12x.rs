@@ -36,6 +36,14 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// Configure offline translation for the same adapter as the runtime.
+pub fn prepare_shader_host() -> Result<(), String> {
+    #[cfg(windows)]
+    { victory_gpu::shader_cache::prepare_host() }
+    #[cfg(not(windows))]
+    { Err("host shader detection requires Windows; set VICTORY_HOST_WAVE and VICTORY_VIEW_LIMIT explicitly".into()) }
+}
+
 /// The offline warm-up: see `victory_gpu::shader_cache::warm`.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     #[cfg(windows)]

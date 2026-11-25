@@ -556,26 +556,38 @@ impl TextureQueue {
 
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    /// - first those already uploaded in part or due for a recheck (their
+    ///   memory is already mapped/held);
+    /// - a bounded leading slice of previously unmapped slots (so views whose
+    ///   memory arrived still make progress without letting tens of thousands
+    ///   of unmapped slots starve new uploads);
+    /// - newly written (`fresh`) slots, the newest write first and the oldest
+    ///   next in turns;
+    /// - any remaining due unmapped slots if room stays under `max`.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
+        let mut active: Vec<(u64, u32, u64)> = Vec::new();
+        let mut waiting: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            let class = if w.checked.2 != 0 || (w.mapped > 0 && w.looks == 0) {
+                &mut active
+            } else if w.looks > 0 {
+                &mut waiting
+            } else {
+                &mut fresh
+            };
             class.push((w.written, index, w.write));
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
+        active.sort_unstable_by(newest_first);
+        waiting.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut order: Vec<(u32, u64)> = active.iter().map(|&(_, index, write)| (index, write)).collect();
+        // Reserve most of the pass for newly written textures when thousands of
+        // unmapped slots are waiting.
+        let waiting_head = waiting.len().min((max / 16).clamp(8, 128));
+        order.extend(waiting[..waiting_head].iter().map(|&(_, index, write)| (index, write)));
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
             order.push((fresh[new].1, fresh[new].2));
@@ -584,6 +596,12 @@ impl TextureQueue {
                 old -= 1;
                 order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        for &(_, index, write) in &waiting[waiting_head..] {
+            if order.len() >= max {
+                break;
+            }
+            order.push((index, write));
         }
         order.truncate(max);
         order
@@ -767,6 +785,33 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// Element count of the title's buffer view `view`, for shaders that read a
+/// structured or typed buffer's size from the host table by slot (the AMD
+/// driver's compiler crashes or stalls on `getDimensions` of some heap views).
+fn view_count(view: &View) -> Option<u32> {
+    const BUFFER: u32 = 1;
+    let (words, unordered): (&[u32; 10], bool) = match view {
+        View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
+        View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
+        View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
+            (d[..10].try_into().ok()?, *unordered)
+        }
+        _ => return None,
+    };
+    // SAFETY: buffer views' union members.
+    unsafe {
+        if unordered {
+            let d = uav_desc(words);
+            (d.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+                .then_some(d.Anonymous.Buffer.NumElements)
+        } else {
+            let d = srv_desc(words);
+            (d.ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+                .then_some(d.Anonymous.Buffer.NumElements)
+        }
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -932,14 +977,16 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                // Strides in [0..SLOT_STRIDES_COUNT), element counts in
+                // [SLOT_STRIDES_COUNT..2 * SLOT_STRIDES_COUNT).
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 2 * 4;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
-                crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
+                crate::host::name(&buffer, || "element strides and counts by view heap slot".to_owned());
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
@@ -1596,12 +1643,20 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
+        let count = view.and_then(view_count);
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            // SAFETY: inside the mapping (`2 * SLOT_STRIDES_COUNT` dwords);
+            // shaders read it while we write (a dword, either value is one
+            // the slot had).
+            unsafe {
+                let words = *data as *mut u32;
+                words.add(index as usize).write_volatile(stride.unwrap_or(0));
+                words
+                    .add((victory_shader::emit::SLOT_STRIDES_COUNT + index) as usize)
+                    .write_volatile(count.unwrap_or(0));
+            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -3202,6 +3257,33 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// Thousands of due unmapped waiting slots must not starve newly written
+    /// (`fresh`) or partially uploaded (`partly`) slots out of a capped pass.
+    #[test]
+    fn the_texture_queue_does_not_starve_fresh_behind_many_waiting() {
+        let mut q = TextureQueue::default();
+        for i in 0..500u32 {
+            q.written(1000 + i, 1, 0, false);
+        }
+        // Mark all 500 slots as partial uploads whose next look found no new
+        // mapped pages (`looks > 0` with `mapped > 0`), plus unmapped slots.
+        for &(slot, write) in &q.due(1, 500) {
+            if slot < 1250 {
+                q.partly(slot, write, 1, 4096);
+                let next_write = q.slots.get(&slot).unwrap().write;
+                q.later(slot, next_write, 1, 1);
+            } else {
+                q.later(slot, write, 1, 1);
+            }
+        }
+        q.written(42, 2, 0, false);
+        let part_write = q.slots.get(&1000).unwrap().write;
+        q.partly(1000, part_write, 2, 8192);
+        let picked: Vec<u32> = q.due(2, 64).into_iter().map(|d| d.0).collect();
+        assert_eq!(picked[0], 1000, "newly advanced partial upload must stay first");
+        assert!(picked.contains(&42), "fresh slot must not be starved behind 500 stalled waiting/partial slots");
     }
 
     /// Slots held back for lack of room on the card are not handed out

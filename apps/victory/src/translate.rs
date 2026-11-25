@@ -156,7 +156,7 @@ struct Checks {
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
-pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, list: bool) -> Result<()> {
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
     let mut wanted: HashSet<String> = HashSet::new();
@@ -180,46 +180,65 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let threads = jobs.unwrap_or(4).max(1);
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
+    let failures = Mutex::new(BTreeMap::<String, (usize, String)>::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+    'files: for root in &paths {
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = entry?;
+            if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
+                counts[3].fetch_add(1, Ordering::Relaxed);
+                break 'files;
+            }
+            if !entry.file_type().is_file() || entry.metadata()?.len() > MAX_FILE {
                 continue;
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
+            let data = std::fs::read(entry.path())?;
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let Some(bytes) = job.bytes() else {
-                                continue;
-                            };
-                            let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
                             if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
                                 counts[3].fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
+                            let Some(bytes) = job.bytes() else {
+                                let example = format!("{}{}", entry.path().display(), job.label());
+                                lock(&failures).entry("corrupt packed shader record".into())
+                                    .or_insert((0, example)).0 += 1;
+                                counts[2].fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            };
+                            let full_hash = blake3::hash(&bytes);
+                            let hash = full_hash.to_hex()[..16].to_owned();
+                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(full_hash) {
                                 continue;
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(1000) {
                                 println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
                             }
-                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
-                                Ok(true) => 0,
-                                Ok(false) => 1,
-                                Err(_) => 2,
+                            let (which, outcome) = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
+                                Ok(true) => (0, "translated".to_owned()),
+                                Ok(false) => (1, "cached".to_owned()),
+                                Err(reason) => {
+                                    let example = format!("{hash} {}{}", entry.path().display(), job.label());
+                                    lock(&failures).entry(reason.clone()).or_insert((0, example)).0 += 1;
+                                    (2, reason)
+                                }
                             };
+                            if list {
+                                println!("{hash} {}{}: {outcome}", entry.path().display(), job.label());
+                            }
                             counts[which].fetch_add(1, Ordering::Relaxed);
                         }
                     });
                 }
             });
+            if counts[3].load(Ordering::Relaxed) > 0 {
+                break 'files;
+            }
         }
     }
     let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
@@ -230,6 +249,16 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
         translated + there + failed,
         began.elapsed().as_secs_f64()
     );
+    for (reason, (n, example)) in failures.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        println!("  {n:>7}  {reason}  (e.g. {example})");
+    }
+    if !all {
+        let found: HashSet<_> = lock(&done).iter().map(|hash| hash.to_hex()[..16].to_owned()).collect();
+        let missing = wanted.difference(&found).count();
+        if missing > 0 {
+            println!("warm-up      {missing} requested hashes were not found before the scan ended");
+        }
+    }
     Ok(())
 }
 

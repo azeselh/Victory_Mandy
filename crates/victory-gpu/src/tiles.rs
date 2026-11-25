@@ -71,14 +71,18 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
-/// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
-/// zeros from, and drops writes to, levels without memory (tiled resources
-/// tier 2).
+/// Whether textures are made this way: on by default outside tests
+/// (`VICTORY_LEVELS_ON_DEMAND=0` disables it; `=1` forces it on), and a card
+/// that reads zeros from, and drops writes to, levels without memory (tiled
+/// resources tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        let enabled = match std::env::var("VICTORY_LEVELS_ON_DEMAND") {
+            Ok(v) => v.trim() == "1",
+            Err(_) => !cfg!(test),
+        };
+        if !enabled {
             return false;
         }
         let Some(host) = host() else {

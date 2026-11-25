@@ -27,6 +27,22 @@ developer or publisher.
   memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+- The local AMD fixes adapt [Belobug's dedicated screen-pipeline workers](https://github.com/Belobug/VIctory-Belobug-AMD/commit/18e57db87d52c7ab4dce6e9c3435d197b218d80c),
+  [pixel helper-lane quad reads](https://github.com/Belobug/VIctory-Belobug-AMD/commit/03629f3f0d3f3329052e05084440aeee75ce3107),
+  [hoisted indirect-draw clamps](https://github.com/Belobug/VIctory-Belobug-AMD/commit/76387c2dea079eb1d31f80402471cb4f55b34d2b),
+  [pixel helper-lane `v_readfirstlane`](https://github.com/Belobug/VIctory-Belobug-AMD/commit/f520772bd1675f7d4bc6397bdb84d5ddfb6b6d76),
+  [weighted first-half interpolations](https://github.com/Belobug/VIctory-Belobug-AMD/commit/2823ba1556e1f6cf691ed2f9c1ba85f1cafce3f9),
+  and [buffer count / lazy descriptor size queries](https://github.com/Belobug/VIctory-Belobug-AMD/commit/1503444b8b08732993ca57d104d71cc64a999476),
+  under the same GPL-3.0-or-later license. Fullscreen vertex/pixel passes
+  get two compilation workers and a separate 20-second wait budget
+  (`VICTORY_SCREEN_PIPELINE_WAIT_MS`); the ordinary queue keeps its
+  priority promotion and shared frame budget. Indirect draw clamps are hoisted
+  into a preceding command list (`VICTORY_HOIST_CLAMPS`, mode 7 by default,
+  `0` to disable) so render passes avoid inter-draw clamp dispatches and
+  barriers. Descriptor size queries are skipped when size dwords are unread,
+  and resource-heap typed/structured buffer counts come from the host slot
+  table instead of `getDimensions` to avoid AMD driver compiler stalls and
+  crashes.
 
 ## Status of this fork (2026-11-25)
 
@@ -276,6 +292,23 @@ target\release\victory.exe run <game dir>\<the title's exe> --execute
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
+
+To prepare shaders before starting, run `./tools/Start-Victory.ps1` after
+building Release, or use the VS Code task **VICTORY Prepare shaders and run**.
+The script reads `game_dir` from the configuration and reuses cached
+translations. If that directory has several executables, pass
+`-TitleExecutable <path>`. `-WarmOnly` prepares the cache without launching;
+`-SkipWarmup` starts immediately. It uses the normal save directory.
+
+Offline preparation (`victory translate <shader files> --warm all`) detects
+the runtime GPU's wave width and descriptor limit before computing cache keys.
+For a different target, set both `VICTORY_HOST_WAVE` and `VICTORY_VIEW_LIMIT`
+explicitly. Embedded containers are hashed only over their declared size,
+so DLL and executable shaders use the same keys as runtime bytecode.
+Failures are reported by reason; `--list` also prints each outcome. Run
+`--validate` or `--pipelines` separately from `--warm` to check DXIL or host
+pipeline creation. Warming translations does not compile every graphics
+pipeline or implement shader instructions that the translator still lacks.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:

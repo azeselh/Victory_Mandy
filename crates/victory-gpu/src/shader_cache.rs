@@ -22,6 +22,14 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// Detect the same wave width and descriptor limit used by runtime
+/// translation before an offline warm-up computes its cache keys.
+pub fn prepare_host() -> Result<(), String> {
+    crate::host::host().ok_or("cannot detect shader target: no host D3D12 device")?;
+    crate::descriptor::host::probe_view_limit();
+    Ok(())
+}
+
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
     match Cache::open(dir) {

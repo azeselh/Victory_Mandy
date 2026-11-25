@@ -207,9 +207,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
-    /// Element strides read from the host's table by heap slot
-    /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
-    strides: HashMap<(usize, Site, u8), V>,
+    /// Element strides and counts read from the host's table by heap slot
+    /// ([`super::shader::SLOT_STRIDES`]), by block, descriptor load, and offset.
+    strides: HashMap<(usize, Site, u8, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -4323,6 +4323,23 @@ impl<'a> Lower<'a> {
         (self.s.m.select(c, any, at, first), any)
     }
 
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead (upstream 0601955).
+    ///
+    /// On the host, wave operations leave pixel helper lanes out: once only
+    /// helper lanes remain in a waterfall loop, `WaveReadLaneFirst` reads
+    /// no active lane and the loop can spin to its iteration limit.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
     fn read_lane(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
@@ -4413,7 +4430,9 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            // Pixel helper lanes participate in quad reads even before a
+            // discard; wave reads may return zero on AMD (Belobug 03629f3).
+            let r = if mesh_quad || self.s.pixel && quad {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -5819,84 +5838,108 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        let sized = if image.is_some() { 1..=4 } else { 2..=2 };
+        let wanted = (0..count).any(|k| {
+            k.checked_sub(u32::from(first))
+                .is_some_and(|rel| sized.contains(&rel))
+                && inst
+                    .write(Reg::S(code + k as u8))
+                    .is_some_and(|v| self.read_as_data(v))
+        });
         let c = self.cur;
-        let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
-            self.s.m.i32(0)
+        let words: Vec<(u32, V)> = if !wanted {
+            Vec::new()
+        } else if image.is_none()
+            && matches!(props.0 & 0xfff, 10 | 12)
+            && let Some(n) = self.slot_dword(&src, super::shader::SLOT_STRIDES_COUNT)?
+        {
+            // A typed or structured buffer from the resource heap reads its
+            // element count from the host table by slot (the AMD driver's
+            // compiler crashes or stalls on `getDimensions` of some heap views).
+            vec![(2, n)]
         } else {
-            self.s.m.undef(i32t)
-        };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
-        let words: Vec<(u32, V)> = match image {
-            Some(kind) => {
-                let one = self.s.m.i32(1);
-                let w = field(self, 0);
-                let (height, depth) = match kind {
-                    1 => (one, one),
-                    2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
-                    _ => (field(self, 1), field(self, 2)),
-                };
-                let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
-                let (w, height, depth, levels) = (
-                    less(self, w),
-                    less(self, height),
-                    less(self, depth),
-                    less(self, levels),
-                );
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k30, k2, k14, k16, mask) = (
-                    k(self, 30),
-                    k(self, 2),
-                    k(self, 14),
-                    k(self, 16),
-                    k(self, 0x3FFF),
-                );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
-                let hi = self.s.m.bin(c, Bin::LShr, w, k2);
-                let hi = self.s.m.bin(c, Bin::And, hi, mask);
-                let ht = self.s.m.bin(c, Bin::Shl, height, k14);
-                let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
-                let base = k(self, 0xFAC | ty << 28);
-                let last = self.s.m.bin(c, Bin::Shl, levels, k16);
-                let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
-            }
-            None => {
-                // A raw view counts bytes; the descriptor's record count is in elements.
-                let n = field(self, 0);
-                let stride = used.map_or(0, |u| u.stride);
-                let n = if props.0 & 0xFF == 11 && stride > 1 {
-                    let k = self.s.m.i32(stride);
-                    self.s.m.bin(c, Bin::UDiv, n, k)
-                } else {
-                    n
-                };
-                let mut words = vec![(2, n)];
-                // Its address too, where the code computes with it and the
-                // host can tell it.
-                let computed = (0..2u8).any(|k| {
-                    inst.write(Reg::S(code + first + k))
-                        .is_some_and(|v| self.computed_with(v, 6))
-                });
-                // (A descriptor nothing uses as one gets it whenever the host can tell it, as
-                // a buffer whose address alone is read does.)
-                if first == 0
-                    && (computed || unused.is_some())
-                    && let Some((lo, hi)) = self.view_address(site)
-                {
-                    words.extend([(0, lo), (1, hi)]);
+            let h = self.handle(site, &src, false, props)?;
+            let c = self.cur;
+            let i32t = self.s.t.i32;
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let mip = if image.is_some() && !uav {
+                self.s.m.i32(0)
+            } else {
+                self.s.m.undef(i32t)
+            };
+            let d = self
+                .s
+                .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
+            match image {
+                Some(kind) => {
+                    let one = self.s.m.i32(1);
+                    let w = field(self, 0);
+                    let (height, depth) = match kind {
+                        1 => (one, one),
+                        2 => (field(self, 1), one),
+                        6 => (one, field(self, 1)),
+                        _ => (field(self, 1), field(self, 2)),
+                    };
+                    let levels = if uav { one } else { field(self, 3) };
+                    let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
+                    let (w, height, depth, levels) = (
+                        less(self, w),
+                        less(self, height),
+                        less(self, depth),
+                        less(self, levels),
+                    );
+                    let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                    let (k30, k2, k14, k16, mask) = (
+                        k(self, 30),
+                        k(self, 2),
+                        k(self, 14),
+                        k(self, 16),
+                        k(self, 0x3FFF),
+                    );
+                    let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+                    let hi = self.s.m.bin(c, Bin::LShr, w, k2);
+                    let hi = self.s.m.bin(c, Bin::And, hi, mask);
+                    let ht = self.s.m.bin(c, Bin::Shl, height, k14);
+                    let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
+                    let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+                    let base = k(self, 0xFAC | ty << 28);
+                    let last = self.s.m.bin(c, Bin::Shl, levels, k16);
+                    let d3 = self.s.m.bin(c, Bin::Or, base, last);
+                    vec![(1, d1), (2, d2), (3, d3), (4, depth)]
                 }
-                words
+                None => {
+                    // A raw view counts bytes; the descriptor's record count is in elements.
+                    let n = field(self, 0);
+                    let stride = used.map_or(0, |u| u.stride);
+                    let n = if props.0 & 0xFF == 11 && stride > 1 {
+                        let k = self.s.m.i32(stride);
+                        self.s.m.bin(c, Bin::UDiv, n, k)
+                    } else {
+                        n
+                    };
+                    vec![(2, n)]
+                }
             }
         };
+        let mut words = words;
+        if image.is_none() {
+            // Its address too, where the code computes with it and the
+            // host can tell it.
+            let computed = (0..2u8).any(|k| {
+                inst.write(Reg::S(code + first + k))
+                    .is_some_and(|v| self.computed_with(v, 6))
+            });
+            // (A descriptor nothing uses as one gets it whenever the host can tell it, as
+            // a buffer whose address alone is read does.)
+            if first == 0
+                && (computed || unused.is_some())
+                && let Some((lo, hi)) = self.view_address(site)
+            {
+                words.extend([(0, lo), (1, hi)]);
+            }
+        }
+        let _ = c;
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
@@ -5971,6 +6014,20 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Whether an instruction or phi reads `v` other than as a resource
+    /// operand of a memory instruction (which takes the descriptor whole).
+    fn read_as_data(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.phis.iter().any(|p| p.args.contains(&v))
+                || b.insts.iter().any(|i| {
+                    !matches!(
+                        i.fields,
+                        Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }
+                    ) && i.reads.iter().any(|r| r.1 == v)
+                })
+        })
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -6408,6 +6465,13 @@ impl<'a> Lower<'a> {
     /// `ResourceHeap`): read from the host's table by heap slot in the
     /// current block.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        self.slot_dword(src, 0)
+    }
+
+    /// What the host's table by heap slot ([`super::shader::SLOT_STRIDES`])
+    /// holds for `src`, `from` dwords on: element strides from 0, element
+    /// counts from [`super::shader::SLOT_STRIDES_COUNT`].
+    fn slot_dword(&mut self, src: &Source, from: u32) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
@@ -6419,7 +6483,7 @@ impl<'a> Lower<'a> {
         if !heap {
             return Ok(None);
         }
-        let key = (self.cur, *load, *first);
+        let key = (self.cur, *load, *first, from);
         if let Some(&v) = self.strides.get(&key) {
             return Ok(Some(v));
         }
@@ -6431,6 +6495,12 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
         self.s.m.tag(slot, Tag::Clamp);
+        let slot = if from != 0 {
+            let from = self.s.m.i32(from);
+            self.s.m.bin(c, Bin::Add, slot, from)
+        } else {
+            slot
+        };
         let two = self.s.m.i32(2);
         let byte = self.s.m.bin(c, Bin::Shl, slot, two);
         let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
@@ -6725,7 +6795,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.s.pixel && quad {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
@@ -7590,6 +7660,7 @@ impl<'a> Lower<'a> {
                         // scalars this way, inside a loop whose exit is per console wave).
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
+                            let mine = self.helper_reads_own(a, mine);
                             return int(self, mine);
                         }
                         need(self.cur_ir);
@@ -7619,6 +7690,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {

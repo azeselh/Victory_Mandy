@@ -460,7 +460,63 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    first_halves_read(p, &mut io);
     Ok(io)
+}
+
+/// A first half some other instruction reads too (the compiler keeps
+/// P0 + i P10 for more than its second half) evaluates on its own as well.
+fn first_halves_read(p: &Program, io: &mut Io) {
+    if !io
+        .interps
+        .iter()
+        .any(|(_, i)| matches!(i, Interp::Interpolated { .. }))
+    {
+        return;
+    }
+    // What instructions other than second halves read, and through phis.
+    let mut read: std::collections::HashSet<Value> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| !i.name().starts_with("v_interp_p2"))
+        .flat_map(|i| i.reads.iter().map(|r| r.1))
+        .collect();
+    loop {
+        let before = read.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if read.contains(&phi.value) {
+                read.extend(phi.args.iter().copied());
+            }
+        }
+        if read.len() == before {
+            break;
+        }
+    }
+    let mut more = Vec::new();
+    for (_, interp) in &io.interps {
+        let Interp::Interpolated {
+            attribute, first, ..
+        } = interp
+        else {
+            continue;
+        };
+        for &(b, i) in first {
+            let known = |all: &[(Site, Interp)]| all.iter().any(|(s, _)| *s == (b, i));
+            if p.blocks[b].insts[i].writes.iter().any(|w| read.contains(&w.1))
+                && !known(&io.interps)
+                && !known(&more)
+            {
+                more.push((
+                    (b, i),
+                    Interp::Weighted {
+                        attribute: *attribute,
+                    },
+                ));
+            }
+        }
+    }
+    io.interps.extend(more);
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
@@ -820,6 +876,41 @@ mod tests {
                 ),
                 (2, Input::Position(0)),
                 (3, Input::Position(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_half_read_by_other_instruction_is_weighted() {
+        // v_interp_p1_f32 v2, v0, attr0.x followed by another instruction reading v2,
+        // and then v_interp_p2_f32 v2, v1, attr0.x: the first half evaluates on its own.
+        let p = program(&[
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        let attribute = Attribute {
+            usage: Usage::Generic,
+            row: 1,
+            channel: 0,
+            high: false,
+        };
+        let mut interps = io.interps.clone();
+        interps.sort_by_key(|i| i.0);
+        assert_eq!(
+            interps,
+            [
+                ((0, 0), Interp::Weighted { attribute }),
+                (
+                    (0, 2),
+                    Interp::Interpolated {
+                        attribute,
+                        barycentric: Barycentric::PerspectiveCenter,
+                        first: vec![(0, 0)],
+                    }
+                ),
             ]
         );
     }

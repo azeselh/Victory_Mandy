@@ -493,6 +493,124 @@ fn record_clamp_as(
     true
 }
 
+/// How clamps of indirect draws are recorded: 0 each before its draw; 1 in
+/// a list of their own before the list that draws, so that a run of draws
+/// is not interleaved with our dispatches; 2 as 1, with a UAV barrier before
+/// each draw. To find faults: 3 as 1 for mesh dispatches only, 4 as 1 for
+/// draws only, 5 as 1 with a new list for clamps always, 6 the lists cut
+/// as for 1 with each clamp before its draw all the same, 7 as 1 with the
+/// clamps run one after another (a barrier between them, the default: avoids
+/// frame-to-frame flicker on objects past the list's budget).
+/// `VICTORY_HOIST_CLAMPS=<n>` sets it; diagnostics builds read it again
+/// every half second from the file `VICTORY_HOIST_FILE` names, if any.
+pub(crate) fn hoist_mode() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
+    let mode = MODE.load(Ordering::Relaxed);
+    if mode == u8::MAX {
+        let set = std::env::var("VICTORY_HOIST_CLAMPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7);
+        MODE.store(set, Ordering::Relaxed);
+        if cfg!(feature = "diagnostics")
+            && let Some(file) = std::env::var_os("VICTORY_HOIST_FILE")
+        {
+            let _ = std::thread::Builder::new().name("victory-hoist".into()).spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let read = std::fs::read_to_string(&file).ok().and_then(|t| t.trim().parse::<u8>().ok());
+                    let cuts = CUTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                    if cuts != [0, 0] {
+                        tracing::info!(cuts = cuts[0], queries = cuts[1], "lists cut for hoisted clamps");
+                    }
+                    if let Some(n) = read.filter(|&n| n < 8 && n != MODE.load(Ordering::Relaxed)) {
+                        MODE.store(n, Ordering::Relaxed);
+                        tracing::info!(mode = n, "clamps of indirect draws: mode changed");
+                    }
+                }
+            });
+        }
+        return set;
+    }
+    mode
+}
+
+/// Cuts made for hoisted clamps, and skipped cuts.
+pub(crate) static CUTS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Whether clamps of indirect draws go to a list before the one that draws.
+pub(crate) fn hoisting() -> bool {
+    hoist_mode() != 0
+}
+
+/// Computes `(gpu_base, byte_offset)` for a 4-byte-aligned buffer region so
+/// the clamp shader's 32-bit byte offset reaches it.
+fn clamp_address(buf: &ID3D12Resource, offset: u64, len: u64) -> Option<(u64, u32)> {
+    // SAFETY: a live D3D12 buffer resource.
+    let base = unsafe { buf.GetGPUVirtualAddress() };
+    if !base.is_multiple_of(4) {
+        return None;
+    }
+    match offset.checked_add(len).filter(|&end| end <= u64::from(u32::MAX)) {
+        Some(_) => Some((base, offset as u32)),
+        None => Some((base.checked_add(offset)?, 0)),
+    }
+}
+
+/// As [`bound`], recorded in `clamps`, a list that runs before the one that
+/// executes: the buffer and the offset of the clamped records, readable as
+/// indirect arguments once `clamps` ended ([`HostList::clamp_end`]).
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    if records == 0 {
+        return None;
+    }
+    let (c, budget) = (clamp()?, clamps.budget()?);
+    let (src_gpu, args_offset) = clamp_address(src, src_offset, bytes)?;
+    let (count_gpu, has_count, count_offset) = match count {
+        Some((buf, off)) => {
+            let (gpu, off) = clamp_address(buf, off, 4)?;
+            (gpu, 1u32, off)
+        }
+        None => (src_gpu, 0u32, 0u32),
+    };
+    if !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (dst, at) = clamps.clamp_room(bytes)?;
+    // SAFETY: a live buffer.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    let l = &clamps.list;
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // count, destination (writable: `clamp_room`) and budget buffers.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        // Mode 7: one clamp after another, so that the budget is charged in
+        // the order of the draws as it is when each clamp precedes its draw.
+        if hoist_mode() == 7 {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
+    }
+    Some((dst, at))
+}
+
 /// Whether every draw served from a window is checked against a fresh
 /// clamp of its record (`VICTORY_INDIRECT_WINDOW_CHECK=1`, with
 /// `VICTORY_INDIRECT_WINDOW=1`; off by default). A window clamps its
@@ -1536,7 +1654,9 @@ void main() {
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
+                // The two waves race for the shared atomic budget; no
+                // dispatch ordering guarantees which valid records win.
+                assert_ne!(i, 0, "the oversized first draw must stay empty");
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
@@ -2046,6 +2166,92 @@ void main() {
             assert_eq!(hits, expected, "every record of both windows runs once");
         }
     }
+
+    /// Clamps hoisted into a separate `HostList` (`bound_before`, `clamp_end`)
+    /// run before a second `HostList` that executes the indirect calls, across
+    /// two record/execute/reset cycles with the debug layer clean.
+    #[test]
+    fn host_list_hoisted_clamps_run_before_executions_and_reset_cleanly() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let (Ok(clamps), Ok(draws)) = (host.new_list(), host.new_list()) else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let signature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(KIND_DISPATCH as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: STRIDE,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &arg,
+                NodeMask: 0,
+            };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a valid single-argument command signature description.
+            unsafe {
+                host.device
+                    .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig)
+                    .unwrap();
+            }
+            sig.unwrap()
+        };
+        let groups: [u32; 3] = [2, 3, 5];
+        let total = groups.len() * STRIDE as usize;
+        let Some((src, src_ptr)) = host.shared_buffer(total as u64) else {
+            return;
+        };
+        let mut bytes = vec![0u8; total];
+        for (i, &g) in groups.iter().enumerate() {
+            for (w, word) in [g, 1, 1].into_iter().enumerate() {
+                let at = i * STRIDE as usize + w * 4;
+                bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        // SAFETY: the mapping holds `total` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), src_ptr, total) };
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        for _ in 0..2 {
+            // SAFETY: the mapping holds 256 bytes; nothing runs.
+            unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+            let mut bounded = Vec::new();
+            for i in 0..3u64 {
+                bounded.push(
+                    bound_before(&clamps, (&src, i * u64::from(STRIDE)), None, (KIND_DISPATCH, STRIDE, 1))
+                        .expect("bound_before must succeed"),
+                );
+            }
+            clamps.clamp_end();
+            clamps.close();
+            // SAFETY: an open list; worker pipeline and bounded indirect argument buffers.
+            unsafe {
+                draws.list.SetComputeRootSignature(&worker.root);
+                draws.list.SetPipelineState(&worker.pso);
+                draws.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                for (buf, at) in &bounded {
+                    draws.list.ExecuteIndirect(&signature, 1, buf, *at, None, 0);
+                }
+            }
+            draws.close();
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&clamps, &draws]);
+            clamps.reset();
+            draws.reset();
+            // SAFETY: both lists have run; mapped buffer.
+            let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+            assert_eq!(hits, 10, "all three hoisted indirect records run once");
+        }
+    }
 }
 
 /// The benchmark of the clamp and its barriers (ignored by default).
@@ -2156,7 +2362,6 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -2464,7 +2669,6 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
                     depth_tested,
                     stamps,
                     back,

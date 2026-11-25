@@ -278,7 +278,8 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     )
                 };
                 let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
-                    | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+                    | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0
+                    | D3D12_FORMAT_SUPPORT1_BLENDABLE.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
                     tracing::info!(format = f, stand_in = to, "the host does not render to this format: a stand-in is used");
@@ -1494,7 +1495,7 @@ pub(crate) fn room_lately() -> bool {
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
+/// textures picked by index are made ([`room`]): 95 unless
 /// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
 /// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
 /// textures wait (runs 170-174); the card copies of title buffers from
@@ -1507,7 +1508,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(95, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -1754,7 +1755,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
+    const IDLE_FRAMES: u64 = 8;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -2549,7 +2550,7 @@ static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }

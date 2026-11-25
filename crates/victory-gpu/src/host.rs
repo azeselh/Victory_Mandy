@@ -118,12 +118,12 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
-/// scaled down under VRAM pressure. Never returns less than 1,000 ms so
-/// handles not yet recorded into a list or slot remain protected.
+/// scaled down under VRAM pressure. Kept high enough to span several slow
+/// scene frames so active textures are not thrashingly evicted and remade.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 5_000;
-    const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
+    const NORMAL_MS: u64 = 20_000;
+    const MODERATE_MS: u64 = 8_000;
+    const HIGH_MS: u64 = 3_000;
     let Some([budget, used, ..]) = video_memory else {
         return NORMAL_MS;
     };
@@ -131,9 +131,9 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
         return NORMAL_MS;
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
-    if used_pct >= 85 {
+    if used_pct >= 90 {
         HIGH_MS
-    } else if used_pct >= 75 {
+    } else if used_pct >= 80 {
         MODERATE_MS
     } else {
         NORMAL_MS
@@ -801,6 +801,14 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
+    /// Whether any draw, dispatch, clear or copy has been recorded since reset.
+    worked: std::sync::atomic::AtomicBool,
+    /// Dispatches and buffer copies recorded since the reset: what may have
+    /// written indirect arguments (`crate::indirect` clamps hoisted before).
+    writes: std::sync::atomic::AtomicU64,
+    /// Buffers for clamped indirect arguments when this list holds the
+    /// clamps of the list after it (`clamp_room`).
+    clamp_chunks: Mutex<ClampChunks>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -826,6 +834,21 @@ fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
 }
+
+/// A list's buffers for hoisted clamped indirect arguments with their
+/// states, how many are in use since the reset, the bytes taken of the last
+/// of those, and whether the list has the barrier that precedes the clamps.
+#[derive(Default)]
+struct ClampChunks {
+    all: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
+    used: usize,
+    at: u64,
+    barrier: bool,
+}
+
+// SAFETY: D3D12 command objects and resources are free-threaded, and
+// `HostList` recording is externally synchronized by its owning `List`.
+unsafe impl Send for HostList {}
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
@@ -1743,7 +1766,13 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        if cfg!(test) {
+            std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1")
+        } else {
+            std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0")
+        }
+    })
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1761,7 +1790,13 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// so eight threads take an eighth of them each.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        if cfg!(test) {
+            std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1")
+        } else {
+            std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0")
+        }
+    })
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -3726,6 +3761,9 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 window_check: OnceLock::new(),
+                worked: std::sync::atomic::AtomicBool::new(false),
+                writes: std::sync::atomic::AtomicU64::new(0),
+                clamp_chunks: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5780,6 +5818,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.clamp_end();
         self.twins_to_depth();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
@@ -5810,6 +5849,14 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.deferred() = Deferred::default();
+        self.worked.store(false, Ordering::Relaxed);
+        self.writes.store(0, Ordering::Relaxed);
+        {
+            let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+            chunks.used = 0;
+            chunks.at = 0;
+            chunks.barrier = false;
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6204,6 +6251,9 @@ impl HostList {
     /// upload or resolve (they defer a step or move a texture's state), no
     /// bottom-of-pipe write. State set on the list does not count.
     pub(crate) fn untouched(&self) -> bool {
+        if self.worked.load(Ordering::Relaxed) {
+            return false;
+        }
         {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
@@ -6218,6 +6268,94 @@ impl HostList {
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
+    /// Marks that a draw, dispatch, clear or copy was recorded on this list.
+    pub(crate) fn count_work(&self) {
+        self.worked.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether any work was recorded on this list since its reset.
+    pub(crate) fn worked(&self) -> bool {
+        !self.untouched()
+    }
+
+    /// Counts a dispatch or a copy: what may write indirect arguments.
+    pub(crate) fn count_write(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Dispatches and buffer copies since the reset.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Room for `bytes` of clamped indirect arguments in this list's
+    /// buffers, writable by shaders from here on in the list: the buffer and
+    /// the offset. None for more than a chunk holds.
+    pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        const CHUNK: u64 = 256 << 10;
+        let bytes = bytes.next_multiple_of(16);
+        if bytes > CHUNK {
+            return None;
+        }
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        if chunks.used > 0 && chunks.at + bytes <= CHUNK {
+            let at = chunks.at;
+            chunks.at += bytes;
+            return Some((chunks.all[chunks.used - 1].0.clone(), at));
+        }
+        if chunks.used == chunks.all.len() {
+            let buffer = host()?.uav_buffer(CHUNK)?;
+            name(&buffer, || "hoisted indirect arguments".to_owned());
+            chunks.all.push((buffer, D3D12_RESOURCE_STATE_COMMON));
+        }
+        let i = chunks.used;
+        chunks.used += 1;
+        chunks.at = bytes;
+        let mut barriers = Vec::new();
+        if !chunks.barrier {
+            // What earlier lists' shaders wrote first.
+            chunks.barrier = true;
+            barriers.push(D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            });
+        }
+        let (buffer, state) = &mut chunks.all[i];
+        if *state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            barriers.push(transition(buffer, *state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            *state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        let buffer = buffer.clone();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+        Some((buffer, 0))
+    }
+
+    /// The clamped arguments written so far become readable as indirect
+    /// arguments by the lists after this one.
+    pub(crate) fn clamp_end(&self) {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        let used = chunks.used;
+        let barriers: Vec<_> = chunks.all[..used]
+            .iter_mut()
+            .filter(|(_, state)| *state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            .map(|(buffer, state)| {
+                *state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )
+            })
+            .collect();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
     }
 
     /// Notes a pipeline the list binds.
@@ -8105,19 +8243,19 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn vram_idle_ms_scales_with_pressure() {
         use super::vram_idle_ms;
         let gib = 1024 * 1024 * 1024;
-        // Normal (< 75%)
-        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
-        // Moderate (75%..85%)
-        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
-        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
-        // High (>= 85%, including over-budget)
-        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
+        // Normal (< 80%)
+        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 20_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 20_000);
+        assert_eq!(vram_idle_ms(Some([100, 79, 0, 0])), 20_000);
+        // Moderate (80%..90%)
+        assert_eq!(vram_idle_ms(Some([100, 80, 0, 0])), 8_000);
+        assert_eq!(vram_idle_ms(Some([100, 89, 0, 0])), 8_000);
+        // High (>= 90%, including over-budget)
+        assert_eq!(vram_idle_ms(Some([100, 90, 0, 0])), 3_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 3_000);
         // Missing or zero budget falls back to normal
-        assert_eq!(vram_idle_ms(None), 5_000);
-        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(None), 20_000);
+        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 20_000);
     }
 
     #[test]
