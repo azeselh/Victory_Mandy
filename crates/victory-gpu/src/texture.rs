@@ -129,9 +129,44 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
+/// Fast non-cryptographic 128-bit fingerprint of a texture's bytes in RAM
+/// for dirty checking, avoiding multi-millisecond cryptographic hashing on
+/// unchanged 20–30 MB per frame.
+fn fast_hash_128(bytes: &[u8]) -> [u64; 2] {
+    const K0: u64 = 0x9e37_79b9_7f4a_7c15;
+    const K1: u64 = 0xc2b2_ae3d_27d4_eb4f;
+    const K2: u64 = 0x1656_67b1_9e37_79f9;
+    const K3: u64 = 0x85eb_ca77_c2b2_ae63;
+    let mut a = K0 ^ (bytes.len() as u64);
+    let mut b = K1 ^ (bytes.len() as u64).rotate_left(19);
+    let mut c = K2;
+    let mut d = K3;
+    let (chunks, tail) = bytes.as_chunks::<32>();
+    for chunk in chunks {
+        let w0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+        let w3 = u64::from_le_bytes(chunk[24..32].try_into().unwrap());
+        a = (a ^ w0).wrapping_mul(K0);
+        b = (b ^ w1).wrapping_mul(K1);
+        c = (c ^ w2).wrapping_mul(K2);
+        d = (d ^ w3).wrapping_mul(K3);
+        a ^= a >> 29;
+        b ^= b >> 31;
+        c ^= c >> 27;
+        d ^= d >> 33;
+    }
+    for &byte in tail {
+        a = (a ^ u64::from(byte)).wrapping_mul(K0);
+    }
+    let lo = (a ^ c).wrapping_mul(K1) ^ (b.rotate_left(17));
+    let hi = (b ^ d).wrapping_mul(K2) ^ (a.rotate_left(23));
+    [lo ^ (lo >> 32), hi ^ (hi >> 32)]
+}
+
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<[u64; 2]>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -1061,7 +1096,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = fast_hash_128(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1081,7 +1116,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = fast_hash_128(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1097,7 +1132,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = fast_hash_128(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1122,7 +1157,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = fast_hash_128(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);

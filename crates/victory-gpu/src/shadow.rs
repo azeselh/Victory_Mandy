@@ -739,7 +739,23 @@ impl Flights {
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+    let len = now.len().min(held.len()).min(title.len());
+    let (now_chunks, now_tail) = now[..len].as_chunks::<32>();
+    let (held_chunks, held_tail) = held[..len].as_chunks_mut::<32>();
+    let (title_chunks, title_tail) = title[..len].as_chunks_mut::<32>();
+    for ((nc, hc), tc) in now_chunks.iter().zip(held_chunks.iter_mut()).zip(title_chunks.iter_mut()) {
+        if nc == hc {
+            continue;
+        }
+        for ((n, h), t) in nc.iter().zip(hc.iter_mut()).zip(tc.iter_mut()) {
+            let wrote = if *n != *h { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*n & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = (*h & !wrote) | (*n & wrote);
+        }
+    }
+    for ((n, h), t) in now_tail.iter().zip(held_tail.iter_mut()).zip(title_tail.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
         let merged = (*t & !wrote) | (*n & wrote);
         differs |= merged ^ *t;

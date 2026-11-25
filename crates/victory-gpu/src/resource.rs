@@ -1756,11 +1756,27 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 8;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_TEXTURE_SWEEP").as_deref() {
+        Ok("0") => 0,
+        Ok("always") => 2,
+        _ => 1,
+    });
+    if mode == 0 {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let video_memory = crate::host::host().and_then(|h| h.video_memory());
+    if mode == 1
+        && let Some([budget, used, ..]) = video_memory
+        && budget > 0
+        && (u128::from(used) * 100) / u128::from(budget) < 72
+    {
+        // Plenty of VRAM headroom (>28% free): keep uploaded textures resident
+        // instead of stalling `submit` on `NtGdiDdDDIDestroyAllocation2` and
+        // forcing recording threads to recreate/re-upload evicted textures.
+        return;
+    }
+    let idle_ms = crate::host::vram_idle_ms(video_memory);
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);

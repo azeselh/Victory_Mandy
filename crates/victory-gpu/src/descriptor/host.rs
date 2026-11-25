@@ -2169,7 +2169,7 @@ impl HostHeap {
             let waiting = if for_draw { None } else { view.waiting_texture() };
             let later = !for_draw && (view.is_buffer() || waiting.is_some());
             if !later {
-                warm_view_resource(view);
+                warm_view_resource(view, for_draw);
             }
         }
 
@@ -2573,7 +2573,7 @@ impl HostHeap {
         let waiting = if for_draw { None } else { view_ref.waiting_texture() };
         let later = !for_draw && (view_ref.is_buffer() || waiting.is_some());
         if !later {
-            warm_view_resource(view_ref);
+            warm_view_resource(view_ref, for_draw);
         }
 
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -3329,22 +3329,42 @@ fn twin_uav(
     Some(desc)
 }
 
-/// Ensures the backing D3D12 texture resource(s) for `view` are created outside
-/// `HostHeap::made` so D3D12 allocations never stall descriptor mirroring on other slots.
-fn warm_view_resource(view: &View) {
+/// Ensures the backing D3D12 texture or buffer resource(s) for `view` are
+/// created outside `HostHeap::made` so D3D12 allocations never stall
+/// descriptor mirroring on other slots.
+fn warm_view_resource(view: &View, for_draw: bool) {
     match view {
+        View::Constant(address, size) if for_draw => {
+            let _ = crate::shadow::find(*address, u64::from(*size));
+        }
         View::Shader(resource, _) => {
-            let _ = crate::resource::host_resource(*resource as crate::object::This);
+            let r = *resource as crate::object::This;
+            if crate::resource::host_resource(r).is_none() && for_draw {
+                if let Some((data, len)) = crate::resource::buffer_bytes(r) {
+                    let _ = crate::shadow::find(data as u64, len);
+                }
+            }
         }
         View::Unordered(resource, _, _) => {
             let r = *resource as crate::object::This;
-            let _ = crate::resource::host_resource(r);
-            let _ = crate::resource::twin_resource(r);
-            let _ = crate::resource::twin_plane_resource(r);
+            if crate::resource::host_resource(r).is_some() {
+                let _ = crate::resource::twin_resource(r);
+                let _ = crate::resource::twin_plane_resource(r);
+            } else if for_draw {
+                if let Some((data, len)) = crate::resource::buffer_bytes(r) {
+                    let _ = crate::shadow::find(data as u64, len);
+                }
+            }
         }
-        View::Placed(false, _, _) => {
-            if let Some(View::Shader(resource, _)) = placed_texture(view) {
-                let _ = crate::resource::host_resource(resource as crate::object::This);
+        View::Placed(_, resource, desc) => {
+            if let Some(View::Shader(r, _)) = placed_texture(view) {
+                let _ = crate::resource::host_resource(r as crate::object::This);
+            } else if for_draw && resource[0] == 1 {
+                let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if len > 0 {
+                    let _ = crate::shadow::find(address, len);
+                }
             }
         }
         _ => {}
