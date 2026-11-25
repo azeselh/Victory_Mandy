@@ -1015,9 +1015,10 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        let end = start.saturating_add(size);
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = waited(1, || crate::watch::writes(start, end, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
@@ -1027,22 +1028,19 @@ impl Staging {
                 return 0;
             }
         }
-        // From here on the texture's memory may be read in place. Held until
-        // that read is done: the runtime changes what title memory shows
-        // only with this taken alone, so what `committed` finds mapped
-        // stays mapped (see `crate::watch::title_memory_reading`; without
-        // it a page went between the asking and the read in runs 71 and
-        // 74).
+        // Pin the exact span through the committed check, hash and detile.
+        // Windows temporarily removes whole physical views on a partial
+        // remap; xmem includes those old extents in its writer range.
         let _mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_range_now(start..end) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_range(start..end))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages

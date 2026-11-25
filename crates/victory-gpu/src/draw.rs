@@ -1489,25 +1489,27 @@ impl State {
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        let mut slots = host.buffer_changes();
+        let bucket = (*passes % 16) as u32;
+        slots.extend(host.buffer_slots_bucket(bucket, 16));
+        slots.sort_unstable();
+        slots.dedup();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
+        let mut handles: Vec<(u32, u64)> = Vec::with_capacity(slots.len());
+        for &index in &slots {
             ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            let Some(view) = host.mirror(index, handle, true) else {
+            if let Some(handle) = heap.handle(index) {
+                handles.push((index, handle));
+            }
+        }
+        let mirrored = host.mirror_buffer_batch(&handles);
+        for (n, (index, maybe_view)) in mirrored.into_iter().enumerate() {
+            let Some(view) = maybe_view else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1517,9 +1519,10 @@ impl State {
             {
                 alive = false;
                 GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
+                let start_idx = n.saturating_sub(63);
+                let last: Vec<String> = handles[start_idx..=n]
                     .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .filter_map(|&(i, h)| crate::descriptor::view(h).map(|v| format!("{i}: {v:?}")))
                     .map(|s| s.chars().take(200).collect())
                     .collect();
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
@@ -2749,7 +2752,7 @@ impl State {
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
                             if kind.is_some() {
-                                host.mirror(title + k, table + u64::from(k) * 32, true);
+                                host.mirror_if_stale(title + k, table + u64::from(k) * 32, true);
                             }
                         }
                     }
