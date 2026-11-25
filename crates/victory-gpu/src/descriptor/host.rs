@@ -104,6 +104,12 @@ pub(crate) struct HostHeap {
     /// Lock-free mirror of [`Self::made`] keys (`0` while null or under update)
     /// so unchanged descriptor slots avoid locking `made`.
     made_keys: Vec<std::sync::atomic::AtomicU64>,
+    /// Per-slot striped locks protecting host descriptor writes (`self.cpu`)
+    /// and `self.kept` so `make()` never runs while holding `self.made`.
+    slot_locks: Box<[Mutex<()>; 64]>,
+    /// Per-slot monotonic version bumped under `self.made` whenever a slot's
+    /// descriptor changes so deferred `make`/`unmake` skips superseded writes.
+    slot_epoch: Vec<std::sync::atomic::AtomicU32>,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1055,6 +1061,10 @@ impl HostHeap {
             made_keys: (0..count)
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
+            slot_locks: Box::new(std::array::from_fn(|_| Mutex::new(()))),
+            slot_epoch: (0..count)
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1480,18 +1490,27 @@ impl HostHeap {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let work: Vec<(u32, u64, u32)> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            slots
+                .into_iter()
+                .filter_map(|slot| {
+                    let key = *made.get(slot as usize)?;
+                    (key != 0).then(|| (slot, key, self.epoch(slot)))
+                })
+                .collect()
+        };
         let mut remade = 0;
-        for slot in slots {
-            let Some(&key) = made.get(slot as usize) else {
-                continue;
-            };
-            if key == 0 {
-                continue;
-            }
+        for (slot, key, my_epoch) in work {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
+            let _slot_guard = self.slot_locks[(slot as usize) & 63]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.epoch(slot) != my_epoch {
+                continue;
+            }
             if let Some(kept) = make(&view, self.cpu(slot)) {
                 self.keep(slot, kept);
                 remade += 1;
@@ -1505,23 +1524,34 @@ impl HostHeap {
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made.get(index as usize).is_none_or(|&key| key == 0) {
-            return false;
-        }
-        self.unmake(&mut made, index);
+        let taken = {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(slot) = made.get_mut(index as usize) else {
+                return false;
+            };
+            if *slot == 0 {
+                return false;
+            }
+            let key = std::mem::take(slot);
+            self.clear_made_fast(index);
+            (key, self.bump_epoch(index))
+        };
+        let (key, my_epoch) = taken;
+        self.apply_unmake(index, key, my_epoch);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
-    /// Makes host slot `index` null again, as it is before its view is
-    /// made: a null view of the kind it held.
-    fn unmake(&self, made: &mut [u64], index: u32) {
-        let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
+    /// Makes host slot `index` null again outside `self.made` if its epoch still matches.
+    fn apply_unmake(&self, index: u32, key: u64, my_epoch: u32) {
+        let _slot_guard = self.slot_locks[(index as usize) & 63]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.epoch(index) != my_epoch {
             return;
-        };
-        self.clear_made_fast(index);
+        }
         if key == 0 {
+            self.make_null(index);
             return;
         }
         match view_at(key as u32, (key >> 32) as u32) {
@@ -1625,6 +1655,20 @@ impl HostHeap {
         if let Some(atom) = self.made_keys.get(index as usize) {
             atom.store(0, AtomicOrdering::Release);
         }
+    }
+
+    #[inline]
+    fn epoch(&self, index: u32) -> u32 {
+        self.slot_epoch
+            .get(index as usize)
+            .map_or(0, |a| a.load(AtomicOrdering::Acquire))
+    }
+
+    #[inline]
+    fn bump_epoch(&self, index: u32) -> u32 {
+        self.slot_epoch.get(index as usize).map_or(0, |a| {
+            a.fetch_add(1, AtomicOrdering::AcqRel).wrapping_add(1)
+        })
     }
 
     /// The queue's part of a write of title slot `index` in `frame`:
@@ -2145,8 +2189,8 @@ impl HostHeap {
         let mut tex_removals: Vec<u32> = Vec::new();
         let mut placed_ops: Vec<(u32, Option<([u32; 14], u64, u32)>, bool)> = Vec::new();
         let mut buffer_ops: Vec<(u32, Option<u32>, Option<u32>)> = Vec::new();
-        let mut pending: Vec<(u32, u64, View, bool)> = Vec::new();
-        let mut kept_ops: Vec<(u32, Option<ID3D12Resource>)> = Vec::new();
+        let mut pending: Vec<(u32, u64, View, bool, u32)> = Vec::new();
+        let mut null_ops: Vec<(u32, Option<u64>, u32)> = Vec::new();
 
         // Warm backing resources outside `self.made` lock so slow D3D12 allocations
         // never block recording threads or descriptor mirroring on other slots.
@@ -2195,12 +2239,7 @@ impl HostHeap {
             let Some(view) = view else {
                 if made[index as usize] != 0 {
                     self.set_made(&mut made, index, 0);
-                    if self.sampler {
-                        self.null_sampler(index);
-                    } else {
-                        null_view(self.cpu(index));
-                    }
-                    kept_ops.push((index, None));
+                    null_ops.push((index, None, self.bump_epoch(index)));
                     if !self.sampler {
                         if self.has_flag(index, FLAG_TEXTURE) {
                             tex_ops.push((index, false, false));
@@ -2317,7 +2356,16 @@ impl HostHeap {
             if return_views {
                 out.push((index, Some(view.clone())));
             }
-            pending.push((index, key, view, later));
+            let old_made = made[index as usize];
+            if later {
+                self.set_made(&mut made, index, 0);
+            } else {
+                self.clear_made_fast(index);
+                made[index as usize] = key;
+            }
+            let my_epoch = self.bump_epoch(index);
+            let _ = old_made;
+            pending.push((index, key, view, later, my_epoch));
         }
 
         if !placed_ops.is_empty() {
@@ -2347,11 +2395,7 @@ impl HostHeap {
                                         && old_key != 0
                                     {
                                         self.clear_made_fast(s);
-                                        match view_at(old_key as u32, (old_key >> 32) as u32) {
-                                            Some(v) => null_for(&v, self.cpu(s)),
-                                            None => null_view(self.cpu(s)),
-                                        }
-                                        kept_ops.push((s, None));
+                                        null_ops.push((s, Some(old_key), self.bump_epoch(s)));
                                     }
                                 }
                             }
@@ -2364,6 +2408,10 @@ impl HostHeap {
                 }
             }
         }
+
+        // Release `self.made` before texture/buffer queue updates and D3D12 view
+        // creation so concurrent recording threads and submissions do not stall.
+        drop(made);
 
         if !tex_ops.is_empty() || !tex_removals.is_empty() {
             let tabled = tabled_out();
@@ -2418,15 +2466,19 @@ impl HostHeap {
             }
         }
 
-        let mut publish_keys: Vec<(u32, u64)> = Vec::with_capacity(pending.len());
-        for (index, key, view, later) in pending {
-            let old_made = made[index as usize];
-            if later {
-                self.set_made(&mut made, index, 0);
-            } else {
-                self.clear_made_fast(index);
-                made[index as usize] = key;
-                publish_keys.push((index, key));
+        for (index, old_key, my_epoch) in null_ops {
+            match old_key {
+                Some(k) => self.apply_unmake(index, k, my_epoch),
+                None => self.apply_unmake(index, 0, my_epoch),
+            }
+        }
+
+        for (index, key, view, later, my_epoch) in pending {
+            let _slot_guard = self.slot_locks[(index as usize) & 63]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.epoch(index) != my_epoch {
+                continue;
             }
             let kept = if later {
                 None
@@ -2436,25 +2488,11 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
-            let res = kept.flatten();
-            if old_made != 0 || !later || res.is_some() {
-                kept_ops.push((index, res));
-            }
-        }
-
-        if !kept_ops.is_empty() {
-            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            for (index, resource) in kept_ops {
-                if let Some(slot) = kept.get_mut(index as usize)
-                    && let Some(old) = std::mem::replace(slot, resource)
-                {
-                    crate::host::retire(old);
-                }
-            }
-        }
-
-        for (index, key) in publish_keys {
-            if let Some(atom) = self.made_keys.get(index as usize) {
+            self.keep(index, kept.flatten());
+            if !later
+                && self.epoch(index) == my_epoch
+                && let Some(atom) = self.made_keys.get(index as usize)
+            {
                 atom.store(key, AtomicOrdering::Release);
             }
         }
@@ -2527,10 +2565,17 @@ impl HostHeap {
             {
                 return None;
             }
-            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            if made[index as usize] != 0 {
-                self.set_made(&mut made, index, 0);
-                self.make_null(index);
+            let unmake_epoch = {
+                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                if made[index as usize] != 0 {
+                    self.set_made(&mut made, index, 0);
+                    Some(self.bump_epoch(index))
+                } else {
+                    None
+                }
+            };
+            if let Some(my_epoch) = unmake_epoch {
+                self.apply_unmake(index, 0, my_epoch);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
                 let _ = self.note_buffer(index, None, false);
@@ -2550,10 +2595,17 @@ impl HostHeap {
             {
                 return None;
             }
-            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            if made[index as usize] != 0 {
-                self.set_made(&mut made, index, 0);
-                self.make_null(index);
+            let unmake_epoch = {
+                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                if made[index as usize] != 0 {
+                    self.set_made(&mut made, index, 0);
+                    Some(self.bump_epoch(index))
+                } else {
+                    None
+                }
+            };
+            if let Some(my_epoch) = unmake_epoch {
+                self.apply_unmake(index, 0, my_epoch);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
@@ -2576,56 +2628,73 @@ impl HostHeap {
             warm_view_resource(view_ref, for_draw);
         }
 
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = view?;
-        if made[index as usize] != key {
-            // Views of other textures in the memory this one describes
-            // are stale: their host slots read nothing from here on, and
-            // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
-                if stale != index {
-                    self.unmake(&mut made, stale);
-                }
-            }
-            // A view of a texture object that has no host copy yet waits
-            // for it, as buffer views wait for a draw: the slot is made
-            // when the texture is first used (`super::make_waiting`), or
-            // here when a draw reads the slot through a table.
-            if let Some(texture) = waiting {
-                super::wait_for(texture, handle);
-            }
-            // Another view of the placed texture the slot shows already (a
-            // title that streams a texture in writes its view again with
-            // more mips each time some arrive): the slot goes on showing
-            // the old view until a draw or the texture pass makes the new
-            // one and uploads what it shows. Made null here, the texture
-            // read as nothing for as long as it waited in the queue, every
-            // time it got sharper.
-            if later
-                && keep_views()
-                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
-                    .is_some_and(|old| same_placed_texture(&old, &view))
-            {
-                KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
-            }
-            if later {
-                self.set_made(&mut made, index, 0);
-            } else {
-                self.clear_made_fast(index);
-                made[index as usize] = key;
-            }
-            let kept = if later {
+        enum Work {
+            KeepOld,
+            Make(u32),
+        }
+        let mut stale_unmakes: Vec<(u32, u64, u32)> = Vec::new();
+        let work = {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            if made[index as usize] == key {
                 None
             } else {
-                make(&view, self.cpu(index))
-            };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+                // Views of other textures in the memory this one describes
+                // are stale: their host slots read nothing from here on, and
+                // let go of the host copies they held.
+                for s in self.note_buffer(index, Some(&view), for_draw) {
+                    if s != index
+                        && let Some(old_key) = made.get_mut(s as usize).map(std::mem::take)
+                        && old_key != 0
+                    {
+                        self.clear_made_fast(s);
+                        stale_unmakes.push((s, old_key, self.bump_epoch(s)));
+                    }
+                }
+                if let Some(texture) = waiting {
+                    super::wait_for(texture, handle);
+                }
+                if later
+                    && keep_views()
+                    && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
+                        .is_some_and(|old| same_placed_texture(&old, &view))
+                {
+                    KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(Work::KeepOld)
+                } else {
+                    if later {
+                        self.set_made(&mut made, index, 0);
+                    } else {
+                        self.clear_made_fast(index);
+                        made[index as usize] = key;
+                    }
+                    Some(Work::Make(self.bump_epoch(index)))
+                }
             }
-            self.keep(index, kept.flatten());
-            if !later && let Some(atom) = self.made_keys.get(index as usize) {
-                atom.store(key, AtomicOrdering::Release);
+        };
+        for (s, old_key, s_epoch) in stale_unmakes {
+            self.apply_unmake(s, old_key, s_epoch);
+        }
+        if let Some(Work::Make(my_epoch)) = work {
+            let _slot_guard = self.slot_locks[(index as usize) & 63]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.epoch(index) == my_epoch {
+                let kept = if later {
+                    None
+                } else {
+                    make(&view, self.cpu(index))
+                };
+                if kept.is_none() && !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, kept.flatten());
+                if !later
+                    && self.epoch(index) == my_epoch
+                    && let Some(atom) = self.made_keys.get(index as usize)
+                {
+                    atom.store(key, AtomicOrdering::Release);
+                }
             }
         }
         Some(view)

@@ -7331,7 +7331,7 @@ mod fill_tests {
 /// they are for the title's threads.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
 
 /// Whether a range of a host copy brought up to date in a submission is
@@ -7355,7 +7355,7 @@ fn wide_refresh() -> bool {
 /// other step that writes title memory takes everything out.
 fn refresh_once() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ONCE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ONCE").is_none_or(|v| v != "0"))
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -7514,26 +7514,57 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
-            // writes that copy and reads title memory, nothing of another's.
-            // The time counted is the time it took, not the threads' sum.
+        let total_bytes: usize = self.refreshes.iter().map(|(_, from, to)| to - from).sum();
+        if wide_refresh() && self.refreshes.len() >= 8 && total_bytes >= (512 << 10) {
+            // Group refreshes by shadow into balanced worker buckets so two
+            // threads never touch the same Shadow locks, while `watch` answers
+            // ahead hits under a shared read lock.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            // Noted now: nothing reads the notes before the jobs are done.
             for (shadow, from, to) in &self.refreshes {
                 Self::brought(&mut self.current, shadow, *from, *to);
             }
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                .collect();
-            crate::shadow::wide_run(jobs);
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
-            PREPARING[0].fetch_sub(over, Ordering::Relaxed);
-            crate::framelog::sub(crate::framelog::T::CopyUs, over);
+            let mut by_shadow: std::collections::HashMap<usize, (usize, Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>)> =
+                std::collections::HashMap::new();
+            for (shadow, from, to) in self.refreshes.drain(..) {
+                let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                let entry = by_shadow.entry(key).or_insert_with(|| (0, Vec::new()));
+                entry.0 += to - from;
+                entry.1.push((shadow, from, to));
+            }
+            let mut groups: Vec<(usize, Vec<_>)> = by_shadow.into_values().collect();
+            groups.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let n_buckets = groups.len().min(4);
+            if n_buckets >= 2 {
+                let mut buckets: Vec<(usize, Vec<_>)> = (0..n_buckets).map(|_| (0, Vec::new())).collect();
+                for (bytes, group) in groups {
+                    let target = buckets.iter().enumerate().min_by_key(|(_, b)| b.0).map(|(i, _)| i).unwrap_or(0);
+                    buckets[target].0 += bytes;
+                    buckets[target].1.extend(group);
+                }
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                    .into_iter()
+                    .filter(|(_, chunk)| !chunk.is_empty())
+                    .map(|(_, chunk)| {
+                        Box::new(move || {
+                            for (shadow, from, to) in chunk {
+                                Self::update(&shadow, from, to);
+                            }
+                        }) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+                let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
+                PREPARING[0].fetch_sub(over, Ordering::Relaxed);
+                crate::framelog::sub(crate::framelog::T::CopyUs, over);
+            } else {
+                for (_, group) in groups {
+                    for (shadow, from, to) in group {
+                        Self::update(&shadow, from, to);
+                    }
+                }
+            }
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);

@@ -1769,19 +1769,28 @@ pub(crate) fn let_go_idle() {
     if mode == 1
         && let Some([budget, used, ..]) = video_memory
         && budget > 0
-        && (u128::from(used) * 100) / u128::from(budget) < 72
+        && (u128::from(used) * 100) / u128::from(budget) < 78
     {
-        // Plenty of VRAM headroom (>28% free): keep uploaded textures resident
+        // Plenty of VRAM headroom (>22% free): keep uploaded textures resident
         // instead of stalling `submit` on `NtGdiDdDDIDestroyAllocation2` and
         // forcing recording threads to recreate/re-upload evicted textures.
         return;
     }
+    let used_pct = video_memory
+        .and_then(|[budget, used, ..]| (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)) as u64))
+        .unwrap_or(100);
+    // Cap each sweep so crossing the VRAM threshold drains idle textures
+    // gradually instead of dumping thousands (gigabytes) in a single frame.
+    let max_went = if mode == 1 && used_pct < 90 { 128 } else if mode == 1 { 512 } else { u64::MAX };
     let idle_ms = crate::host::vram_idle_ms(video_memory);
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
     for &at in all.iter() {
+        if went >= max_went {
+            break;
+        }
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
