@@ -114,6 +114,19 @@ const GTA_BUTTONS: [(u8, u32); 26] = [
     (b'G', LEFT),           // G: Throw / Context left (D-pad Left)
 ];
 
+/// Whether GTA mouse-look lock (`~` / `F2`) is currently active; read by
+/// `lifecycle` on `WM_SETCURSOR` to auto-hide the Windows cursor inside the
+/// game window's client area while locked.
+#[cfg(windows)]
+static CURSOR_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Returns true while GTA mouse-look lock (`~` / `F2`) is active and the
+/// cursor should be hidden inside the client area.
+#[cfg(windows)]
+pub(crate) fn cursor_locked() -> bool {
+    CURSOR_LOCKED.load(Ordering::Relaxed)
+}
+
 /// GTA V PC-style keyboard + mouse stand-in pad (`VICTORY_KBM_GTA=1`).
 /// Off by default so the existing keyboard table and tests stay unchanged.
 fn gta_kbm() -> bool {
@@ -1255,7 +1268,7 @@ mod host {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
-        SetCursorPos,
+        HTCLIENT, PostMessageW, SetCursorPos, WM_MOUSEMOVE, WM_SETCURSOR,
     };
 
     use super::*;
@@ -1306,6 +1319,26 @@ mod host {
         anchor: (i32, i32),
         mouse_last_poll: Option<Instant>,
         mouse_look: MouseLook,
+    }
+
+    impl Host {
+        fn set_mouse_locked(&mut self, locked: bool, hwnd: Option<HWND>) {
+            if self.mouse_locked == locked {
+                return;
+            }
+            self.mouse_locked = locked;
+            CURSOR_LOCKED.store(locked, Ordering::Release);
+            if let Some(hwnd) = hwnd {
+                // Prompt the window's UI thread to run WM_SETCURSOR right away
+                // so the cursor hides/reappears the instant `~`/`F2`/`Esc`/`P`
+                // is pressed, even before moving the mouse.
+                let lparam = (HTCLIENT as isize) | ((WM_MOUSEMOVE as isize) << 16);
+                // SAFETY: asynchronous post to our own process's foreground window.
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_SETCURSOR, hwnd as usize, lparam);
+                }
+            }
+        }
     }
 
     impl Source for Host {
@@ -1375,7 +1408,7 @@ mod host {
             }
             let Some(hwnd) = foreground_window() else {
                 if self.mouse_locked {
-                    self.mouse_locked = false;
+                    self.set_mouse_locked(false, None);
                     tracing::info!("mouse look unlocked (focus lost)");
                 }
                 self.mouse_look.reset();
@@ -1392,17 +1425,18 @@ mod host {
             // Toggle mouse-look lock with F2 (0x71) or ` / ~ (0xC0).
             let toggle_down = key_down(0x71) || key_down(0xC0);
             if toggle_down && !self.toggle_was_down {
-                self.mouse_locked = !self.mouse_locked;
-                self.just_locked = self.mouse_locked;
+                let next = !self.mouse_locked;
+                self.set_mouse_locked(next, Some(hwnd));
+                self.just_locked = next;
                 self.mouse_look.reset();
-                tracing::info!(locked = self.mouse_locked, "mouse look toggled");
+                tracing::info!(locked = next, "mouse look toggled");
             }
             self.toggle_was_down = toggle_down;
 
             // Esc (0x1B) or P opens the pause menu and frees the mouse so the
             // user is never trapped in mouse-look mode.
             if self.mouse_locked && (key_down(0x1B) || key_down(i32::from(b'P'))) {
-                self.mouse_locked = false;
+                self.set_mouse_locked(false, Some(hwnd));
                 self.mouse_look.reset();
                 tracing::info!("mouse look unlocked (menu key)");
             }
