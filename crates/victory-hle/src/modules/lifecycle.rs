@@ -280,6 +280,8 @@ extern "system" fn window_proc(
                 let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
                 wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
             };
+            // SAFETY: runs on this window's UI thread; restores the standard
+            // arrow cursor if the title's window procedure left none set.
             unsafe {
                 if wm::GetCursor().is_null() {
                     let arrow = wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW);
