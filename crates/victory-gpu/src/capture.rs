@@ -120,22 +120,6 @@ fn world_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
 }
 
-/// Every how many world frames a picture is saved with
-/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, 8 unless said).
-///
-/// A saved frame is read back at once and written as a PNG inside the
-/// present: run 225's frame log has every saved frame of the cell at 371 ms
-/// against a usual 136 (the present's own copy and show 137 ms instead of
-/// 2, and 123 ms more waiting for the card). At every 8th frame that was
-/// the regular dip of every test run, and a fifth of its time. A run that
-/// measures speed asks for 64 or more.
-fn world_every() -> u64 {
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
-    })
-}
-
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -167,7 +151,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
@@ -194,6 +178,27 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
+    let png = encode(w, h, &raw);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::write(&path, png) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+/// A PNG of `width * height` pixels of 8-bit RGB.
+pub(crate) fn png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let row = width as usize * 3;
+    let mut raw = Vec::with_capacity((row + 1) * height as usize);
+    for line in rgb.chunks_exact(row.max(1)) {
+        raw.push(0);
+        raw.extend_from_slice(line);
+    }
+    encode(width, height, &raw)
+}
+
+/// A PNG of rows of RGB, each behind its filter byte.
+fn encode(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
     header.extend(w.to_be_bytes());
@@ -201,15 +206,11 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
     let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
-    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, raw, zlib_rs::DeflateConfig::new(3));
     debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -357,7 +358,7 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
 /// Notes a title texture the frame being built renders to or writes.
@@ -556,10 +557,10 @@ fn small_float(bits: u32, man: u32) -> f32 {
     }
 }
 
-/// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
-/// as channel values scaled so the largest finite one is white (single
-/// channels: lowest black, highest white, as grey). `None` for formats not
-/// handled.
+/// Converts host-format rows to opaque 8-bit RGBA for the RGB dump. Byte
+/// colors and packed 16-bit BGR use their full channel range. Other formats
+/// scale to the highest finite value, with single channels shown in grey
+/// from their lowest to highest value. Returns `None` for unhandled formats.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
@@ -583,6 +584,30 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
                 for x in 0..w {
                     let p = px(x, y, 4);
                     out.extend([p[2], p[1], p[0], 255]);
+                }
+            }
+            return Some(out);
+        }
+        // B5G6R5, B5G5R5A1 and B4G4R4A4 store blue in the low bits.
+        85 | 86 | 115 => {
+            let (rb_bits, green_bits) = match format {
+                85 => (5, 6),
+                86 => (5, 5),
+                _ => (4, 4),
+            };
+            let unorm8 = |value: u16, bits: u32| {
+                let max = (1u16 << bits) - 1;
+                (((value & max) * 255 + max / 2) / max) as u8
+            };
+            for y in 0..h {
+                for x in 0..w {
+                    let word = u16_at(px(x, y, 2), 0);
+                    out.extend([
+                        unorm8(word >> (rb_bits + green_bits), rb_bits),
+                        unorm8(word >> rb_bits, green_bits),
+                        unorm8(word, rb_bits),
+                        255,
+                    ]);
                 }
             }
             return Some(out);
@@ -845,6 +870,28 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn packed_bgr_targets_preserve_color_and_skip_row_padding() {
+        // Each 2x2 target has red, green, blue and a mixed color. The first
+        // row has a padding word, and alpha bits do not affect the RGB dump.
+        for (format, words, mixed) in [
+            (85, [0xf800u16, 0x07e0, 0x001f, 0x8408], [132, 130, 66, 255]),
+            (86, [0x7c00, 0x03e0, 0x801f, 0xc208], [132, 132, 66, 255]),
+            (115, [0x0f00, 0x00f0, 0xf00f, 0xf841], [136, 68, 17, 255]),
+        ] {
+            let [red, green, blue, blend] = words;
+            let rows = [red, green, 0xcafe, blue, blend]
+                .map(u16::to_le_bytes)
+                .concat();
+            let expected = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], mixed].concat();
+            assert_eq!(
+                super::to_rgba(format, 2, 2, 6, &rows),
+                Some(expected),
+                "format {format}"
+            );
+        }
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,

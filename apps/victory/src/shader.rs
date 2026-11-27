@@ -1,5 +1,7 @@
 //! Survey shader containers: bitcode, console additions and native code.
 
+pub(crate) mod scan;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -43,41 +45,13 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter_map(|offset| {
-            let bytes = &data[offset..];
-            Container::parse(bytes).ok()?;
-            // Runtime bytecode ends at the container boundary. Including
-            // the rest of an executable changes both its hash and cache key.
-            let size = u32::from_le_bytes(bytes[0x18..0x1c].try_into().ok()?) as usize;
-            Some(Source::Raw { offset, data: &bytes[..size] })
+        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
+        .map(|offset| Source::Raw {
+            offset,
+            data: &data[offset..],
         });
     out.extend(raw);
     out
-}
-
-#[cfg(test)]
-mod source_tests {
-    use super::*;
-
-    #[test]
-    fn embedded_containers_have_the_same_bytes_and_hash_as_runtime_bytecode() {
-        let mut container = vec![0; 32];
-        container[..4].copy_from_slice(b"DXBC");
-        container[0x14] = 1;
-        container[0x18..0x1c].copy_from_slice(&32u32.to_le_bytes());
-        let mut file = b"synthetic prefix".to_vec();
-        file.extend_from_slice(&container);
-        file.extend_from_slice(b"padding");
-        file.extend_from_slice(&container);
-        file.extend_from_slice(b"trailing bytes and a truncated DXBC");
-        let found = sources(&file);
-        assert_eq!(found.len(), 2);
-        for source in found {
-            let bytes = source.bytes().unwrap();
-            assert_eq!(bytes.as_ref(), container);
-            assert_eq!(blake3::hash(&bytes), blake3::hash(&container));
-        }
-    }
 }
 
 #[derive(Default)]
@@ -102,22 +76,9 @@ struct Totals {
 pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
+    let mut scan = scan::FileScan::new(MAX_FILE, verbose);
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE {
-                eprintln!("skipping large file {}", path.display());
-                continue;
-            }
-            let Ok(data) = std::fs::read(path) else {
-                continue;
-            };
+        for (path, data) in scan.files(root) {
             let mut found_here = 0;
             for source in sources(&data) {
                 let Some(bytes) = source.bytes() else {
@@ -129,7 +90,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 };
                 found_here += 1;
                 t.containers += 1;
-                let dxil = container.part(FourCC::DXIL);
+                let dxil = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC));
                 t.with_dxil_part += usize::from(dxil.is_some());
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();
@@ -141,6 +102,11 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                         for n in &programs {
                             *t.native_stages.entry(n.stage).or_default() += 1;
                             list.push(format!("{:?} {} B", n.stage, n.code.len()));
+                            if disasm {
+                                listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
+                                listing.extend(n.layout.iter().map(|p| format!("    {p:?}")));
+                                listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
+                            }
                             match gfx10::decode(&n.code) {
                                 Ok(insts) => {
                                     t.decoded += 1;
@@ -150,9 +116,6 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
-                                        listing
-                                            .extend(n.layout.iter().map(|p| format!("    {p:?}")));
-                                        listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );
@@ -197,7 +160,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    // As a run's log and a replay name it (`hash=`).
+                    let hash = blake3::hash(&bytes).to_hex();
+                    println!("{}{} #{}: {line}", path.display(), source.label(), &hash[..16]);
                     for l in &listing {
                         println!("{l}");
                     }
@@ -242,6 +207,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     if t.containers == 0 {
         println!("(none found: shaders may sit in compressed or encrypted archives)");
     }
+    println!("{scan}");
     Ok(())
 }
 

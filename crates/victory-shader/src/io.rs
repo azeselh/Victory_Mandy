@@ -26,10 +26,10 @@
 //! index from the wave index (s3 bits 24-27) and the lane (`v_mbcnt`), and
 //! its group id from v5 of the first lane (`v_readfirstlane`: the group
 //! times the group size). Lane n exports vertex n (`exp pos`, `exp param`)
-//! and primitive n (`exp prim`: 10-bit vertex indices at bits 0, 10, 20,
-//! bit 31 culls); `param` entries with bit 7 are per-primitive outputs. One
-//! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
-//! primitives << 12).
+//! and primitive n (`exp prim`: 9-bit vertex indices at bits 0, 10, 20,
+//! each with an edge flag above it, bit 31 culls); `param` entries with
+//! bit 7 are per-primitive outputs. One lane sends the output counts
+//! (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices | primitives << 12).
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
@@ -369,6 +369,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    let mut first_halves = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -382,7 +383,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => first_halves.push((site, attribute)),
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -402,7 +403,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        first_halves.push((site, attribute(inst, &v.src[0])?));
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -460,63 +463,53 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
-    first_halves_read(p, &mut io);
-    Ok(io)
-}
-
-/// A first half some other instruction reads too (the compiler keeps
-/// P0 + i P10 for more than its second half) evaluates on its own as well.
-fn first_halves_read(p: &Program, io: &mut Io) {
-    if !io
+    if first_halves.is_empty() {
+        return Ok(io);
+    }
+    // A loaded i/j pair normally becomes one host interpolation: its first
+    // half need not be evaluated. A first half also read as data (or used
+    // without a second half) must keep P0 + i * P10. Follow phi uses too,
+    // without forcing ordinary pairs to read per-vertex attributes.
+    let folded: std::collections::HashSet<_> = io
         .interps
         .iter()
-        .any(|(_, i)| matches!(i, Interp::Interpolated { .. }))
-    {
-        return;
-    }
-    // What instructions other than second halves read, and through phis.
-    let mut read: std::collections::HashSet<Value> = p
+        .filter_map(|(s, i)| matches!(i, Interp::Interpolated { .. }).then_some(*s))
+        .collect();
+    let mut used: std::collections::HashSet<_> = p
         .blocks
         .iter()
-        .flat_map(|b| &b.insts)
-        .filter(|i| !i.name().starts_with("v_interp_p2"))
-        .flat_map(|i| i.reads.iter().map(|r| r.1))
+        .enumerate()
+        .flat_map(|(b, blk)| {
+            blk.insts
+                .iter()
+                .enumerate()
+                .map(move |(i, inst)| ((b, i), inst))
+        })
+        .filter(|(s, _)| !folded.contains(s))
+        .flat_map(|(_, inst)| inst.reads.iter().map(|r| r.1))
         .collect();
     loop {
-        let before = read.len();
+        let before = used.len();
         for phi in p.blocks.iter().flat_map(|b| &b.phis) {
-            if read.contains(&phi.value) {
-                read.extend(phi.args.iter().copied());
+            if used.contains(&phi.value) {
+                used.extend(&phi.args);
             }
         }
-        if read.len() == before {
+        if used.len() == before {
             break;
         }
     }
-    let mut more = Vec::new();
-    for (_, interp) in &io.interps {
-        let Interp::Interpolated {
-            attribute, first, ..
-        } = interp
-        else {
-            continue;
-        };
-        for &(b, i) in first {
-            let known = |all: &[(Site, Interp)]| all.iter().any(|(s, _)| *s == (b, i));
-            if p.blocks[b].insts[i].writes.iter().any(|w| read.contains(&w.1))
-                && !known(&io.interps)
-                && !known(&more)
-            {
-                more.push((
-                    (b, i),
-                    Interp::Weighted {
-                        attribute: *attribute,
-                    },
-                ));
-            }
+    for (site, attribute) in first_halves {
+        if !io.interps.iter().any(|(s, _)| *s == site)
+            && p.blocks[site.0].insts[site.1]
+                .writes
+                .iter()
+                .any(|w| used.contains(&w.1))
+        {
+            io.interps.push((site, Interp::Weighted { attribute }));
         }
     }
-    io.interps.extend(more);
+    Ok(io)
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
@@ -782,6 +775,50 @@ mod tests {
     }
 
     #[test]
+    fn first_halves_read_through_a_phi_keep_their_partial_values() {
+        let p = program(&[
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> second first half
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xBF82_0001, // s_branch -> export
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps.len(), 2);
+        assert!(
+            io.interps
+                .iter()
+                .all(|(_, i)| matches!(i, Interp::Weighted { .. }))
+        );
+    }
+
+    #[test]
+    fn a_standalone_f16_first_half_is_weighted() {
+        let p = program(&[
+            0xD742_0002,
+            0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202,
+            S_ENDPGM,
+        ]);
+        let io = raise(
+            &p,
+            &pixel(
+                vec![PsInput {
+                    fp16: true,
+                    ..TEXCOORD
+                }],
+                2,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(&io.interps[..], [(_, Interp::Weighted { .. })]));
+    }
+
+    #[test]
     fn mesh_inputs_and_primitive_export() {
         let mesh = |words: &[u32]| {
             let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -876,41 +913,6 @@ mod tests {
                 ),
                 (2, Input::Position(0)),
                 (3, Input::Position(1)),
-            ]
-        );
-    }
-
-    #[test]
-    fn first_half_read_by_other_instruction_is_weighted() {
-        // v_interp_p1_f32 v2, v0, attr0.x followed by another instruction reading v2,
-        // and then v_interp_p2_f32 v2, v1, attr0.x: the first half evaluates on its own.
-        let p = program(&[
-            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
-            0x7E06_0302, // v_mov_b32 v3, v2
-            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
-            S_ENDPGM,
-        ]);
-        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
-        let attribute = Attribute {
-            usage: Usage::Generic,
-            row: 1,
-            channel: 0,
-            high: false,
-        };
-        let mut interps = io.interps.clone();
-        interps.sort_by_key(|i| i.0);
-        assert_eq!(
-            interps,
-            [
-                ((0, 0), Interp::Weighted { attribute }),
-                (
-                    (0, 2),
-                    Interp::Interpolated {
-                        attribute,
-                        barycentric: Barycentric::PerspectiveCenter,
-                        first: vec![(0, 0)],
-                    }
-                ),
             ]
         );
     }
