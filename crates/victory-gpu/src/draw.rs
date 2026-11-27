@@ -397,7 +397,7 @@ pub(crate) struct State {
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
-    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    host_targets: Option<(Few<TargetKey, 8>, Option<TargetKey>)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -1344,8 +1344,11 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut views = Vec::with_capacity(handles.len());
-        let mut keys = Vec::with_capacity(handles.len());
+        let mut stack_views: [Option<(Option<&ID3D12Resource>, Option<D3D12_RENDER_TARGET_VIEW_DESC>)>; 8] = [const { None }; 8];
+        let mut stack_len = 0usize;
+        let mut heap_views = Vec::new();
+        let use_stack = handles.len() <= 8;
+        let mut keys: Few<TargetKey, 8> = Few::default();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1365,7 +1368,12 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    views.push((None, Some(desc)));
+                    if use_stack {
+                        stack_views[stack_len] = Some((None, Some(desc)));
+                        stack_len += 1;
+                    } else {
+                        heap_views.push((None, Some(desc)));
+                    }
                     keys.push((0, record.key()));
                 }
                 continue;
@@ -1373,7 +1381,12 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            views.push((Some(texture), record.desc()));
+            if use_stack {
+                stack_views[stack_len] = Some((Some(texture), record.desc()));
+                stack_len += 1;
+            } else {
+                heap_views.push((Some(texture), record.desc()));
+            }
             keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
@@ -1389,25 +1402,43 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
-        let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
+        let dsv_key = dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key()));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
-            && self.host_targets.as_ref() == Some(&now)
+            && self.host_targets.as_ref().is_some_and(|(k, d)| &**k == &*keys && *d == dsv_key)
         {
             return;
         }
-        self.host_targets = Some(now);
-        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        self.host_targets = Some((keys, dsv_key));
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
-        // SAFETY: an open list; the views were just made.
-        unsafe {
-            list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
-                false,
-                dsv.as_ref().map(std::ptr::from_ref),
-            )
-        };
+        if use_stack {
+            let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+            for (dst, entry) in rtvs.iter_mut().zip(&stack_views[..stack_len]) {
+                if let Some((texture, desc)) = entry {
+                    *dst = host.rtv(*texture, desc.as_ref());
+                }
+            }
+            // SAFETY: an open list; the views were just made.
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    stack_len as u32,
+                    (stack_len > 0).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
+        } else {
+            let rtvs: Vec<_> = heap_views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+            // SAFETY: an open list; the views were just made.
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    rtvs.len() as u32,
+                    (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
+        }
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -1656,19 +1687,21 @@ impl State {
 
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
-    fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
+    fn prepare(&mut self, list: &HostList, indexed: bool) -> Option<&'static HostPipeline> {
         self.prepare_for(list, indexed, false)
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> Option<&'static HostPipeline> {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return None;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
-        };
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        self.prepare_with(list, p, indexed, mesh).then_some(p)
+    }
+
+    fn prepare_with(&mut self, list: &HostList, p: &HostPipeline, indexed: bool, mesh: bool) -> bool {
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
@@ -1800,18 +1833,21 @@ impl State {
             if fallback && sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut heap_n = 0;
             if let Some(h) = view_heap {
                 list.keep(&h);
-                heaps.push(Some(h));
+                heaps[heap_n] = Some(h);
+                heap_n += 1;
             }
             if let Some(h) = sampler_heap {
                 list.keep(&h);
-                heaps.push(Some(h));
+                heaps[heap_n] = Some(h);
+                heap_n += 1;
             }
-            if !heaps.is_empty() {
+            if heap_n > 0 {
                 // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+                unsafe { l.SetDescriptorHeaps(&heaps[..heap_n]) };
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
@@ -3489,30 +3525,29 @@ impl State {
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
-            && self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
-                    #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
-                    self.mesh_scissor(list, true);
-                    #[cfg(feature = "diagnostics")]
-                    if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+            && self
+                .prepare_for(list, false, true)
+                .is_some_and(|p| match list.list.cast::<ID3D12GraphicsCommandList6>() {
+                    Ok(l6) => {
+                        #[cfg(feature = "diagnostics")]
+                        list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                        self.mesh_scissor(list, true);
+                        #[cfg(feature = "diagnostics")]
                         list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
-                    }
-                    // (The host takes 65,535 groups in a dimension: more is
-                    // undefined there.)
-                    if x > 65_535 {
-                        once!(x, "a mesh dispatch of more groups than the host takes: cut");
-                    }
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+                        // (The host takes 65,535 groups in a dimension: more is
+                        // undefined there.)
+                        if x > 65_535 {
+                            once!(x, "a mesh dispatch of more groups than the host takes: cut");
+                        }
+                        // SAFETY: an open list with everything set.
+                        unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                        self.drew(list, Some(p));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
                 Err(_) => false,
-            };
+            });
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -3676,22 +3711,28 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = group
-                .indexed
-                .iter()
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
-            selected.sort_unstable();
-            selected.dedup();
+            let mut selected: Few<u32, 8> = Few::default();
+            for index in &group.indexed {
+                let constant = self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                );
+                // The shader adds i32 byte offsets and shifts by 5.
+                selected.push(index.byte_offset.wrapping_add(constant << index.shift) / 32);
+            }
+            if selected.len() > 1 {
+                selected.sort_unstable();
+                let mut unique = 1;
+                for i in 1..selected.len() {
+                    if selected[i] != selected[unique - 1] {
+                        selected[unique] = selected[i];
+                        unique += 1;
+                    }
+                }
+                selected.truncate(unique);
+            }
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
@@ -3735,7 +3776,7 @@ impl State {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
+                for &k in &*selected {
                     if group.entry(k).is_some() {
                         continue;
                     }
@@ -3975,8 +4016,8 @@ impl State {
         let ready = self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
-        let rects = self.topology == RECTANGLES && !self.completes_rects();
-        let ran = ready && (!rects || self.rectangles(list, vertices, first));
+        let rects = self.topology == RECTANGLES && !ready.is_some_and(|p| p.rects);
+        let ran = ready.is_some() && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -3991,7 +4032,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, ready);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3999,12 +4040,6 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
-    }
-
-    /// Whether the bound pipeline completes rectangles itself, in the
-    /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
-    fn completes_rects(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -4081,13 +4116,18 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        // Indexed rectangles are drawn by the rectangle geometry stage
-        // alone (nothing expands them on the CPU).
-        let lost = self.topology == RECTANGLES && !self.completes_rects();
-        if lost {
-            once!("indexed rectangles not drawn");
-        }
-        let ran = !lost && self.prepare(list, true);
+        let ready = if self.topology == RECTANGLES {
+            let p = self.prepare(list, true);
+            if p.is_some_and(|p| !p.rects) {
+                once!("indexed rectangles not drawn");
+                None
+            } else {
+                p
+            }
+        } else {
+            self.prepare(list, true)
+        };
+        let ran = ready.is_some();
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -4096,7 +4136,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, ready);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4361,8 +4401,8 @@ impl State {
             }
         };
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
+            DRAW | INDEXED => self.prepare_with(list, p, kind == INDEXED, false),
+            MESH => self.prepare_with(list, p, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
@@ -4551,6 +4591,14 @@ impl<T: Copy, const N: usize> Few<T, N> {
                 self.many.extend_from_slice(&self.few);
             }
             self.many.push(what);
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        if self.many.is_empty() {
+            self.len = self.len.min(len);
+        } else {
+            self.many.truncate(len);
         }
     }
 }
