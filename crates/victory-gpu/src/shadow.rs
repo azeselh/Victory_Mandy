@@ -41,18 +41,15 @@ pub(crate) struct Shadow {
     start: u64,
     len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
-    /// after which it was last copied (0: never).
-    copied: Mutex<Vec<u64>>,
-    /// Two ranges of title memory taken whole, the last one and the longest,
-    /// and the asking after which each was ([`Shadow::copy_stale`]). A page
-    /// a range holds in part cannot say so in `copied`. Locked inside
-    /// `copied`'s lock.
-    ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// after which it was last copied (0: never), plus two ranges taken whole.
+    copied: Mutex<CopiedPages>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free hint of `!pending.is_empty()`: updated under `pending`'s lock.
+    pending_any: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -106,6 +103,24 @@ pub(crate) struct Shadow {
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
+struct CopiedPages {
+    pages: Vec<u64>,
+    ranged: [(usize, usize, u64); 2],
+}
+
+impl CopiedPages {
+    fn new(pages: usize) -> Self {
+        Self {
+            pages: vec![0; pages],
+            ranged: [(0, 0, 0); 2],
+        }
+    }
+
+    fn ranged(&self, from: usize, to: usize) -> u64 {
+        self.ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
+    }
+}
+
 struct Card {
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
@@ -776,7 +791,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
             continue;
         };
         let written: std::collections::HashMap<usize, u64> = written.into_iter().collect();
-        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).pages.clone();
         for (i, &at) in copied.iter().enumerate() {
             let page = start / PAGE + i;
             if at == 0 || written.get(&page).is_some_and(|&w| w > at) {
@@ -1601,9 +1616,17 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`, default
+/// `cores / 4` clamped to `2..=6`).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 16))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -3047,7 +3070,7 @@ pub(crate) fn window_use() -> [u64; 8] {
     let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        let pages = copied.pages.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -3319,10 +3342,10 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
-            ranged: Mutex::default(),
+            copied: Mutex::new(CopiedPages::new(pages as usize)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_any: Default::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3401,6 +3424,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.pending_any.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3425,6 +3449,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.pending_any.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3714,6 +3739,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.pending_any.store(!pending.is_empty(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -3768,16 +3794,35 @@ impl Shadow {
         }
     }
 
+    fn changed_runs(&self, runs: &[(usize, usize)]) {
+        if !keeps() || runs.is_empty() {
+            return;
+        }
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.0.is_empty() {
+            return;
+        }
+        for &(from, to) in runs {
+            if from < to {
+                for piece in self.pieces(from, to) {
+                    kept.0[piece] = false;
+                }
+            }
+        }
+    }
+
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.pending_any.load(Ordering::Acquire)
+            && !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        self.pending_any.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -3797,6 +3842,9 @@ impl Shadow {
         if from >= to {
             return false;
         }
+        if !self.pending_any.load(Ordering::Acquire) {
+            return false;
+        }
         let busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -3814,7 +3862,7 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => !stale_pages_in(base, &copied.pages, a, e, &written).is_empty(),
             None => true,
         })
     }
@@ -3839,6 +3887,9 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
+            return false;
+        }
+        if !self.pending_any.load(Ordering::Acquire) {
             return false;
         }
         let busy: Vec<(usize, usize)> = self
@@ -3878,7 +3929,7 @@ impl Shadow {
             let t = under_ns(0, t);
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                stale_pages_in(base, &copied.pages, a, e, &written)
             };
             UNDER_NS[8].fetch_add(stale.len() as u64, Ordering::Relaxed);
             let t = under_ns(1, t);
@@ -3966,7 +4017,7 @@ impl Shadow {
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 for page in taken {
-                    if let Some(at) = copied.get_mut(page - base) {
+                    if let Some(at) = copied.pages.get_mut(page - base) {
                         *at = now;
                     }
                 }
@@ -4087,14 +4138,17 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        let mut busy: Vec<(usize, usize)> = if self.pending_any.load(Ordering::Acquire) {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -4131,11 +4185,14 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.pending_any.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let ranged = copied.ranged(from, to);
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied.pages, ranged);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4143,13 +4200,6 @@ impl Shadow {
             add(C::Unchanged, (to - from) as u64);
         }
         same
-    }
-
-    /// The latest asking after which a range that holds `[from, to)` was
-    /// taken whole (0: none is known). The caller holds `copied`'s lock.
-    fn ranged(&self, from: usize, to: usize) -> u64 {
-        let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-        ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -4251,11 +4301,12 @@ impl Shadow {
         // of the heap's buffer views alone two ends for each of 4,400
         // copies, every frame. A range that was taken whole, and not written
         // since, is as it was.
-        let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
+        let ranged = if crate::watch::light() { copied.ranged(from, to) } else { 0 };
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
         let last = (to - 1) / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -4264,12 +4315,11 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
+            let at = &mut copied.pages[page - base];
             let taken = (*at).max(ranged);
             if taken == 0 || write > taken {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
@@ -4293,25 +4343,24 @@ impl Shadow {
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
-        let bytes = if runs.is_empty() {
-            0
-        } else {
-            let runs = if again_at.is_empty() {
-                runs
-            } else {
-                by_parts(runs, &again_at, &crate::watch::parts_written(&again_at))
-            };
-            self.take_all(runs)
-        };
-        if crate::watch::light() {
+        let light = crate::watch::light();
+        if light {
             // All of the range is in the copy as of this asking.
-            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-            ranged[0] = (from, to, now);
-            if to - from >= ranged[1].1 - ranged[1].0 {
-                ranged[1] = (from, to, now);
+            copied.ranged[0] = (from, to, now);
+            if to - from >= copied.ranged[1].1 - copied.ranged[1].0 {
+                copied.ranged[1] = (from, to, now);
             }
         }
-        bytes
+        drop(copied);
+        if runs.is_empty() {
+            return 0;
+        }
+        let runs = if again_at.is_empty() {
+            runs
+        } else {
+            by_parts(runs, &again_at, &crate::watch::parts_written(&again_at))
+        };
+        self.take_all(runs)
     }
 
     /// [`Shadow::take`] of `runs` (from, to, known), on several threads if
@@ -4439,6 +4488,14 @@ impl Shadow {
             return self.copy(from, to);
         };
         let whole = !known && card.before.get().is_none();
+        if whole && !crate::host::upcheck::on() {
+            let bytes = self.copy(from, to);
+            let pages = if from < to { ((to - 1) / PAGE - from / PAGE + 1) as u64 } else { 0 };
+            SEND[0].fetch_add(bytes as u64, Ordering::Relaxed);
+            SEND[2].fetch_add(bytes as u64, Ordering::Relaxed);
+            SEND[3].fetch_add(pages, Ordering::Relaxed);
+            return bytes;
+        }
         let start = self.start as usize;
         let mut batch_runs = Vec::new();
         TITLE.with_borrow_mut(|title| {
@@ -4458,7 +4515,6 @@ impl Shadow {
                 let runs = if whole { vec![(0, n)] } else { word_runs(at, held, title) };
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
-                    self.changed(at - start + a, at - start + a + len);
                     batch_runs.push((at - start + a, at - start + a + len));
                 }
                 if let Some(was) = was {
@@ -4474,6 +4530,7 @@ impl Shadow {
             }
         });
         if !batch_runs.is_empty() {
+            self.changed_runs(&batch_runs);
             self.card_changed_runs(batch_runs.into_iter());
         }
         to - from
@@ -4983,7 +5040,7 @@ impl Shadow {
             return false;
         };
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(at) = copied.get_mut(page) else {
+        let Some(at) = copied.pages.get_mut(page) else {
             return false;
         };
         let held = *at != 0 && *at >= before && crate::watch::block_published(block);
@@ -5124,6 +5181,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.pending_any.store(true, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };

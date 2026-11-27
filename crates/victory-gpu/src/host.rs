@@ -8615,7 +8615,8 @@ impl Batch {
         {
             return;
         }
-        if let Some(&(from, to)) = self.ahead.get(&key)
+        if !self.ahead.is_empty()
+            && let Some(&(from, to)) = self.ahead.get(&key)
             && from <= address
             && end <= to
         {

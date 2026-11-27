@@ -20,6 +20,10 @@ sample,frame,elapsed_ms,interval_ms,dropped
     if ($r.Intervals -ne 0 -or $null -ne $r.WeightedFps -or $r.CompleteWindow) { throw 'Empty capture accepted.' }
     $r = & $measure -CsvPath $csv -AfterSeconds 0 -UntilSeconds 10
     if ($r.CompleteWindow) { throw 'Truncated capture accepted.' }
+    $r = & $measure -CsvPath $csv -AfterSeconds 0 -AfterFrame 104 -UntilFrame 106
+    if ($r.Intervals -ne 2 -or $r.FirstFrame -ne 104 -or $r.LastFrame -ne 106 -or $r.WeightedFps -ne 20 -or -not $r.CompleteWindow) {
+        throw 'Frame-range filtering is incorrect.'
+    }
     Add-Content -LiteralPath $csv -Value "6,108,200,40,1`n7,109,240,40,1`n8,110,NaN,40,1"
     $r = & $measure -CsvPath $csv -AfterSeconds 0
     if ($r.SequenceGaps -ne 1 -or $r.InvalidRows -ne 1 -or $r.CompleteWindow) { throw 'Missing or invalid samples accepted.' }
