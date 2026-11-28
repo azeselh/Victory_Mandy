@@ -327,16 +327,19 @@ fn the_titles_upscaler_runs_on_the_host() {
         let at = D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: first.ptr + i * step,
         };
-        victory_gpu::external::record(list, |l| {
+        let resource_addr = resource as usize;
+        let host_dev = host.clone();
+        assert!(victory_gpu::external::record(list, move |l| {
+            let resource = resource_addr as This;
             let (texture, state) = l.texture(resource, RENDER_TARGET).unwrap();
             assert_eq!(state, RENDER_TARGET);
             // SAFETY: our heap, a live texture, and an open list.
             unsafe {
-                host.CreateRenderTargetView(&texture, None, at);
+                host_dev.CreateRenderTargetView(&texture, None, at);
                 l.commands().ClearRenderTargetView(at, &value, None);
             }
-        })
-        .unwrap();
+            true
+        }));
     }
 
     // The title's context: HDR, inverted depth, auto exposure; its device;
@@ -533,12 +536,15 @@ fn the_titles_upscaler_runs_on_the_host() {
         .unwrap();
         buffer.unwrap()
     };
-    victory_gpu::external::record(list, |l| {
+    let upscaled_addr = upscaled as usize;
+    let readback_copy = readback.clone();
+    assert!(victory_gpu::external::record(list, move |l| {
+        let upscaled = upscaled_addr as This;
         let (texture, state) = l.texture(upscaled, COPY_SOURCE).unwrap();
         assert_eq!(state, COPY_SOURCE);
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: borrowed; the location never releases it.
-            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            pResource: unsafe { std::mem::transmute_copy(&readback_copy) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
@@ -563,8 +569,8 @@ fn the_titles_upscaler_runs_on_the_host() {
         };
         // SAFETY: an open list and live resources.
         unsafe { l.commands().CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-    })
-    .unwrap();
+        true
+    }));
     slot::<extern "system" fn(This) -> i32>(list, 0x48)(list);
     slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 

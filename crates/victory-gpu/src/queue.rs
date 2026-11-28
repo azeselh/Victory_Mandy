@@ -162,7 +162,7 @@ fn submit_cut(this: This, lists: &[This]) {
         // from the title's lists (which it may reset before they have run)
         // and come back, with their tables' slots, when they are settled.
         let (taken, order) = crate::list::detach(&lists[..first]);
-        host.execute_late(taken, order);
+        crate::host::two_queues::for_title(Some(queue(this).kind), 0, || host.execute_late(taken, order));
     } else if first > 0 {
         let now: Vec<_> = lists[..first]
             .iter()
@@ -244,6 +244,12 @@ fn submit_split(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
+        // They have run: their descriptor tables' slots are free again, as
+        // in `submit_cut` (which does this after the same call, for the
+        // same reason: the lists are not detached here, so nothing else
+        // gives their fresh tables' dynamic slots back before the title
+        // resets them).
+        crate::list::tables_done(&lists[..cut]);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -383,7 +389,7 @@ pub(crate) fn release_held(all: bool) {
                         {
                             // Not waited for: the host keeps the lists
                             // until they are settled.
-                            host.execute_late(lists, order);
+                            crate::host::two_queues::for_title(kind_of(q), 0, || host.execute_late(lists, order));
                         } else {
                             let ran = {
                                 let runs: Vec<&crate::host::HostList> =
@@ -499,6 +505,8 @@ pub(crate) extern "system" fn create(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "command queue");
+    #[cfg(windows)]
+    let kind = desc.kind;
     let queue = Box::new(Queue {
         object: if crate::device::newer() {
             Object::new(&NEWER_FUNCTIONS)
@@ -510,7 +518,29 @@ pub(crate) extern "system" fn create(
         #[cfg(windows)]
         held: Default::default(),
     });
-    object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
+    let made = object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out);
+    #[cfg(windows)]
+    if made == S_OK
+        // SAFETY: the out pointer was written.
+        && let Some(&queue_at) = unsafe { out.as_ref() }
+    {
+        let mut kinds = lock(&KINDS);
+        kinds.retain(|k| k.0 != queue_at as usize);
+        kinds.push((queue_at as usize, kind));
+    }
+    made
+}
+
+/// The title's queues (their addresses) and their list types, for what is
+/// done with a queue's submission later, on another thread, when the
+/// queue may have been let go ([`kind_of`]).
+#[cfg(windows)]
+static KINDS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The list type of the title's queue at `queue`, if it is one.
+#[cfg(windows)]
+pub(crate) fn kind_of(queue: usize) -> Option<u32> {
+    lock(&KINDS).iter().find(|k| k.0 == queue).map(|k| k.1)
 }
 
 /// The console's queue description: an engine or pipe and a queue on it
@@ -559,6 +589,7 @@ extern "system" fn release(this: This) -> u32 {
     #[cfg(windows)]
     if left == 0 {
         lock(&WAITING).retain(|&q| q != this as usize);
+        lock(&KINDS).retain(|k| k.0 != this as usize);
     }
     left
 }
@@ -665,26 +696,6 @@ struct RetailPlane {
 }
 #[cfg(windows)]
 const _: () = assert!(size_of::<RetailPlane>() == 72);
-
-/// Whether the second plane of a present is shown over the first
-/// (`VICTORY_PLANES=1`, [`crate::compose::on`]). Says once, either way, that
-/// the title presents more than one plane and what the second one is.
-#[cfg(windows)]
-fn planes_seen(planes: u32, parameters: *const Plane) -> bool {
-    static ONCE: AtomicBool = AtomicBool::new(false);
-    let on = crate::compose::on();
-    if !ONCE.swap(true, Ordering::Relaxed) {
-        let second = overlay_resource(parameters);
-        tracing::info!(
-            planes,
-            second = ?second,
-            second_known = second.is_some_and(|r| crate::resource::host_resource(r).is_some()),
-            composed = on,
-            "the title presents more than one plane (VICTORY_PLANES=1: the second is composed over the first)"
-        );
-    }
-    on
-}
 
 #[cfg(windows)]
 fn overlay_resource(parameters: *const Plane) -> Option<This> {
@@ -857,6 +868,8 @@ impl Written {
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
+            #[cfg(windows)]
+            windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
         }
     }
 }
@@ -944,22 +957,7 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    let info_tick = frame >= 2048 && frame.is_multiple_of(256) && tracing::enabled!(tracing::Level::INFO);
-    if frame.is_power_of_two() || info_tick {
-        static LAST_PRESENT_AT: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
-        let timing = if info_tick || cfg!(feature = "diagnostics") {
-            let now = std::time::Instant::now();
-            let mut prev = LAST_PRESENT_AT.lock().unwrap_or_else(|e| e.into_inner());
-            let out = prev.and_then(|(f, at)| {
-                let df = frame.saturating_sub(f);
-                let dt = now.duration_since(at).as_secs_f64();
-                (df > 0 && dt > 0.0).then(|| (df as f64 / dt, dt * 1000.0 / df as f64))
-            });
-            *prev = Some((frame, now));
-            out
-        } else {
-            None
-        };
+    if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
         let (drawn, dispatched) = {
@@ -973,31 +971,29 @@ extern "system" fn present(
         };
         #[cfg(not(windows))]
         let (drawn, dispatched) = (0, 0);
-        if let Some((fps, ms)) = timing {
-            tracing::info!(
-                frame,
-                fps = format_args!("{fps:.2}"),
-                ms = format_args!("{ms:.1}"),
-                draws,
-                drawn,
-                dispatches,
-                dispatched,
-                "frame presented (since the last line: draws and dispatches, and those run on the host)"
-            );
-        } else {
-            tracing::info!(
-                frame,
-                draws,
-                drawn,
-                dispatches,
-                dispatched,
-                "frame presented (since the last line: draws and dispatches, and those run on the host)"
-            );
-        }
+        tracing::info!(
+            frame,
+            draws,
+            drawn,
+            dispatches,
+            dispatched,
+            "frame presented (since the last line: draws and dispatches, and those run on the host)"
+        );
         #[cfg(windows)]
-        if frame.is_power_of_two() && frame >= 256 {
+        if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            // `VICTORY_EARLY_DEPTH`: what became of the console's early depth
+            // test in the pixel programs translated so far.
+            let [given, off, exports] = victory_shader::emit::early_depth_counts();
+            if given + off + exports > 0 {
+                tracing::info!(
+                    given,
+                    off,
+                    exports,
+                    "pixel programs translated so far whose console code tests depth before them: given the host's early test (VICTORY_EARLY_DEPTH=1), left with the late test (switch off), left with it as they write depth or stencil"
+                );
+            }
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1033,7 +1029,7 @@ extern "system" fn present(
             })
         };
         let texture = base_res.and_then(take_copy);
-        let overlay = (planes > 1 && !plane_parameters.is_null() && planes_seen(planes, plane_parameters))
+        let overlay = (planes > 1 && !plane_parameters.is_null())
             .then(|| overlay_resource(plane_parameters))
             .flatten()
             .filter(|&over_res| base_res != Some(over_res))
@@ -1064,7 +1060,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let overlay = (planes > 1 && planes_seen(planes, plane_parameters))
+        let overlay = (planes > 1)
             .then(|| overlay_resource(plane_parameters))
             .flatten()
             .filter(|&over_res| over_res != resource)
@@ -1105,18 +1101,6 @@ fn frame_ends() {
             behind::leave();
         }
     });
-    if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
-        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
-            crate::cores::settle();
-        }
-    }
-    if let Some(on) = crate::ab::pick("VICTORY_CACHE_CORES") {
-        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
-            crate::cores::settle();
-        }
-    }
 }
 
 /// The frame a present shows, and the title's resource it shows.
@@ -1393,7 +1377,7 @@ mod tests {
 
     #[test]
     fn a_pair_of_timestamps_shows_the_load_it_is_given() {
-        let (start, end) = (0xd_0419_6698, 0xd_0419_6690);
+        let (start, end) = (0x000d_0419_6698, 0x000d_0419_6690);
         assert_eq!(as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000), 4_000_000);
         assert_eq!(as_loaded(5_000_000, start, 0), 5_000_000);
         assert_eq!(as_loaded(5, start, 100), 1);

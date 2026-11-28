@@ -71,7 +71,7 @@ static STACK: AtomicPtr<[usize; DEPTH]> = AtomicPtr::new(std::ptr::null_mut());
 static NEXT_STACK: AtomicUsize = AtomicUsize::new(0);
 
 /// [`ticks`] per second.
-pub(crate) fn frequency() -> u64 {
+pub(super) fn frequency() -> u64 {
     static TICKS: OnceLock<u64> = OnceLock::new();
     *TICKS.get_or_init(|| {
         let mut ticks = 0;
@@ -117,6 +117,10 @@ pub(super) fn put(kind: Kind, name: &'static str, t: (u64, u64), a: u64, b: u64,
 
 /// Records an event of `thread`.
 fn put_of(thread: u32, kind: Kind, name: &'static str, (t0, t1): (u64, u64), a: u64, b: u64, stack: u32) {
+    // After `end`, a place would be one of the next recording's.
+    if !on() {
+        return;
+    }
     let slots = SLOTS.load(Ordering::Acquire);
     if slots.is_null() {
         return;
@@ -138,6 +142,9 @@ fn put_of(thread: u32, kind: Kind, name: &'static str, (t0, t1): (u64, u64), a: 
 
 /// The caller's stack: its place, plus one.
 fn stack() -> u32 {
+    if !on() {
+        return 0;
+    }
     let stacks = STACK.load(Ordering::Acquire);
     if stacks.is_null() {
         return 0;
@@ -291,12 +298,18 @@ pub(super) fn kernel(name: &'static str, bytes: u64, t0: u64) {
 }
 
 /// Lists went to the card between `t0` ([`ticks`]) and now, the value
-/// `fence` signalled behind them, with the timestamps at `stamp`.
-pub(crate) fn sent(t0: u64, fence: u64, stamp: Option<usize>) {
+/// `fence` signalled behind them, with the timestamps at `stamp`;
+/// `compute`: a submission of a compute queue of the title's ([`COMPUTE`]).
+pub(crate) fn sent(t0: u64, fence: u64, stamp: Option<usize>, compute: bool) {
     if on() {
-        put(Kind::Sent, "ExecuteCommandLists", (t0, ticks()), fence, stamp.map_or(0, |s| s as u64 + 1), 0);
+        let b = stamp.map_or(0, |s| s as u64 + 1) | if compute { COMPUTE } else { 0 };
+        put(Kind::Sent, "ExecuteCommandLists", (t0, ticks()), fence, b, 0);
     }
 }
+
+/// The bit of a sent event's second word (the timestamps' place plus one)
+/// that says it was a submission of a compute queue of the title's.
+pub(super) const COMPUTE: u64 = 1 << 63;
 
 /// `value` is being stored at `at`, where the title looks for it.
 #[inline(always)]

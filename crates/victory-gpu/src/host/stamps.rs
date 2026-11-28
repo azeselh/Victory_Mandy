@@ -94,27 +94,12 @@ fn times(taken: usize) -> Vec<(u64, u64)> {
         return Vec::new();
     }
     // By the two calibrations, the card's clock as it ran between them.
-    // Over very short intervals (< 50 ms), GetClockCalibration's per-sample
-    // jitter dominates `(pc - pc0) / (card - card0)`, so fall back to the
-    // nominal clock ratio and average the two calibration offsets.
     let (card0, pc0) = stamps.calibrated;
-    let qpc_hz = crate::timeline::frequency() as f64;
-    let nominal = qpc_hz / frequency as f64;
-    let passed = card.saturating_sub(card0);
-    let rate = if passed >= frequency / 20 {
-        pc.saturating_sub(pc0) as f64 / passed as f64
-    } else {
-        nominal
+    let rate = match card.saturating_sub(card0) {
+        0 => 1e7 / frequency as f64,
+        passed => pc.saturating_sub(pc0) as f64 / passed as f64,
     };
-    let place = |ticks: u64| {
-        let p0 = pc0 as f64 + (ticks as f64 - card0 as f64) * rate;
-        if passed >= frequency / 20 {
-            p0.max(0.0) as u64
-        } else {
-            let p1 = pc as f64 + (ticks as f64 - card as f64) * rate;
-            (0.5 * (p0 + p1)).max(0.0) as u64
-        }
-    };
+    let place = |ticks: u64| (pc0 as f64 + (ticks as f64 - card0 as f64) * rate) as u64;
     (0..taken)
         .map(|at| match (back[at], back[MOST + at]) {
             (0, _) | (_, 0) => (0, 0),

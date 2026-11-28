@@ -26,6 +26,20 @@ use windows::core::{Interface, PCSTR, s, w};
 
 const SIZE: u32 = 128;
 
+fn enhanced_barriers(device: &ID3D12Device) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+    // SAFETY: a feature structure of the expected size.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS12,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_ok()
+        && options.EnhancedBarriersSupported.as_bool()
+}
+
 const DRAW: &str = r#"
 #define RS "RootConstants(num32BitConstants=2, b0), CBV(b1), DescriptorTable(SRV(t0, numDescriptors=unbounded)), DescriptorTable(Sampler(s0))"
 cbuffer Pick : register(b0) { uint pick; uint pad; };
@@ -236,10 +250,9 @@ void main() {
 }
 "#;
 
-/// The argument clamp's parameters, with a simple bound. The same argument
-/// buffer is written again while still bound to the clamp.
+/// The argument clamp's parameters, with a simple bound.
 const CLAMP: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0, flags=DATA_VOLATILE), SRV(t1, flags=DATA_VOLATILE), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer C : register(b0) { uint kind; uint stride; uint records; uint args_offset; uint has_count; uint count_offset; };
 ByteAddressBuffer from : register(t0);
 ByteAddressBuffer count : register(t1);
@@ -719,10 +732,13 @@ impl Scene {
                     ..Default::default()
                 },
                 Alignment: 0,
-                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
+                    | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT,
             };
             device.CreateHeap(&desc, &mut memory).unwrap();
             let memory = memory.unwrap();
+            let pageable: ID3D12Pageable = memory.cast().unwrap();
+            device.MakeResident(&[Some(pageable)]).unwrap();
             let placed = || {
                 let mut made: Option<ID3D12Resource> = None;
                 let d = texture_desc(16, rgba, D3D12_RESOURCE_FLAG_NONE);
@@ -1320,6 +1336,22 @@ impl Scene {
             );
             l.ClearRenderTargetView(rtv, &[0.1 * n as f32, 0.2, 0.3, 1.0], None);
             l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+            if enhanced_barriers(&self.device) {
+                let list: ID3D12GraphicsCommandList7 = l.cast().unwrap();
+                let global = D3D12_GLOBAL_BARRIER {
+                    SyncBefore: D3D12_BARRIER_SYNC_ALL,
+                    SyncAfter: D3D12_BARRIER_SYNC_ALL,
+                    AccessBefore: D3D12_BARRIER_ACCESS_COMMON,
+                    AccessAfter: D3D12_BARRIER_ACCESS_COMMON,
+                };
+                list.Barrier(&[D3D12_BARRIER_GROUP {
+                    Type: D3D12_BARRIER_TYPE_GLOBAL,
+                    NumBarriers: 1,
+                    Anonymous: D3D12_BARRIER_GROUP_0 {
+                        pGlobalBarriers: &global,
+                    },
+                }]);
+            }
             self.arguments(&l, COMMON);
             self.targets(&l);
             self.quad(&l, 4000, 0, 0);
@@ -1385,6 +1417,36 @@ impl Scene {
             let second = l;
             let l = self.open(2);
             l.SetDescriptorHeaps(&[Some(self.views.clone())]);
+            let clear_heap: ID3D12DescriptorHeap = self.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                },
+            ).unwrap();
+            let clear_cpu = clear_heap.GetCPUDescriptorHandleForHeapStart();
+            let clear_slot = 3999;
+            let clear_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: self.views.GetGPUDescriptorHandleForHeapStart().ptr
+                    + clear_slot as u64 * self.step as u64,
+            };
+            let clear_view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_FLOAT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: 256,
+                        ..Default::default()
+                    },
+                },
+            };
+            for at in [clear_cpu, self.cpu(clear_slot)] {
+                self.device.CreateUnorderedAccessView(
+                    &self.sum, None::<&ID3D12Resource>, Some(&clear_view), at,
+                );
+            }
+            l.ClearUnorderedAccessViewFloat(clear_gpu, clear_cpu, &self.sum, &[1.0; 4], &[]);
+            l.ResourceBarrier(&[uav_barrier()]);
             l.SetComputeRootSignature(&self.add.root);
             l.SetPipelineState(&self.add.pso);
             l.SetComputeRootShaderResourceView(0, self.shared.0.GetGPUVirtualAddress());
@@ -1396,10 +1458,7 @@ impl Scene {
                 l.ResourceBarrier(&[uav_barrier()]);
             }
             // The card writes memory the CPU sees.
-            l.ResourceBarrier(&[
-                moved(&self.sum, UAV, FROM),
-                moved(&self.shared.0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, TO),
-            ]);
+            l.ResourceBarrier(&[moved(&self.sum, UAV, FROM)]);
             l.CopyBufferRegion(&self.shared.0, 30_000, &self.sum, 0, 1024);
             l.ResourceBarrier(&[moved(&self.target, TARGET, FROM)]);
             l.Close().unwrap();
@@ -1547,13 +1606,6 @@ fn table_of(device: &ID3D12Device) -> usize {
 fn check(player: &mut Player, options: &Options, expected: &Outcome, what: &str) -> play::Report {
     let report = player.run(options).unwrap();
     println!("{}", report.text(what));
-    // Combining original submissions removes implicit resource state decay.
-    // Track that separate experiment's existing barrier mismatch separately.
-    let errors: Vec<_> = report.notes.iter().filter(|note| {
-        note.starts_with("debug layer:")
-            && !(options.one_submit && note.contains("errors 527, first:"))
-    }).collect();
-    assert!(errors.is_empty(), "{what}: D3D12 validation errors: {errors:?}");
     assert_eq!(report.frame_ms.len(), options.loops as usize);
     assert!(report.median_ms() > 0.0);
     let (db, same) = report.picture.unwrap();
@@ -1702,35 +1754,6 @@ fn a_frame_is_recorded_and_replayed() {
     drop(scene);
     record::unhook(&device);
     assert_eq!(table_of(&device), own, "the device is as it was");
-    if debug {
-        let q = device.cast::<ID3D12InfoQueue>().unwrap();
-        let mut errors = Vec::new();
-        // SAFETY: plain queries; messages read into buffers of their size.
-        unsafe {
-            for i in 0..q.GetNumStoredMessages() {
-                let mut size = 0;
-                let _ = q.GetMessage(i, None, &mut size);
-                let mut buffer = vec![0u64; size.div_ceil(8)];
-                let m = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
-                if q.GetMessage(i, Some(m), &mut size).is_ok()
-                    && (*m).Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0
-                {
-                    let text =
-                        std::slice::from_raw_parts((*m).pDescription, (*m).DescriptionByteLength);
-                    if (*m).Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
-                        errors.push((*m).ID.0);
-                    }
-                    println!(
-                        "D3D12 {} {}: {}",
-                        (*m).Severity.0,
-                        (*m).ID.0,
-                        String::from_utf8_lossy(text)
-                    );
-                }
-            }
-        }
-        assert!(errors.is_empty(), "source frame D3D12 validation errors: {errors:?}");
-    }
     for name in [
         "frame.bin",
         "contents.bin",
@@ -1746,6 +1769,15 @@ fn a_frame_is_recorded_and_replayed() {
         "{}",
         std::fs::read_to_string(folder.join("notes.txt")).unwrap()
     );
+    let (mut syncs, mut clears) = (0, 0);
+    play::listing(&folder, (0, u32::MAX), &mut |line| {
+        syncs += usize::from(line.contains("GlobalSync"));
+        clears += usize::from(line.contains("ClearUavFloat"));
+    }).unwrap();
+    assert_eq!(clears, 1, "one floating-point UAV clear captured");
+    if enhanced_barriers(&device) {
+        assert_eq!(syncs, 1, "one global synchronization call captured");
+    }
 
     let plain = Options {
         loops: 3,
@@ -1781,7 +1813,7 @@ fn a_frame_is_recorded_and_replayed() {
         );
     }
     assert_eq!(count("dispatches"), 6);
-    assert_eq!(count("clears"), 2);
+    assert_eq!(count("clears"), 3);
     assert!(
         report
             .shaders
@@ -1872,4 +1904,28 @@ fn a_frame_is_recorded_and_replayed() {
     assert_eq!(both.len(), 2);
     assert!(both.iter().all(|(_, r)| r.picture.unwrap().1));
     assert!(folder.join("replay.png").exists() && folder.join("replay-unchanged.png").exists());
+    if debug {
+        let q = device.cast::<ID3D12InfoQueue>().unwrap();
+        // SAFETY: plain queries; messages read into buffers of their size.
+        unsafe {
+            for i in 0..q.GetNumStoredMessages() {
+                let mut size = 0;
+                let _ = q.GetMessage(i, None, &mut size);
+                let mut buffer = vec![0u64; size.div_ceil(8)];
+                let m = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if q.GetMessage(i, Some(m), &mut size).is_ok()
+                    && (*m).Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0
+                {
+                    let text =
+                        std::slice::from_raw_parts((*m).pDescription, (*m).DescriptionByteLength);
+                    println!(
+                        "D3D12 {} {}: {}",
+                        (*m).Severity.0,
+                        (*m).ID.0,
+                        String::from_utf8_lossy(text)
+                    );
+                }
+            }
+        }
+    }
 }

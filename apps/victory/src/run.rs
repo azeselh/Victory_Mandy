@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
-#[cfg(windows)]
 #[path = "fsr_4k.rs"]
 mod fsr_4k;
+#[path = "native_1440p.rs"]
+mod native_1440p;
 
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
@@ -39,6 +40,70 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// The executable a run was pointed at: the file itself, or, given a folder, the one
+/// executable in it (of several, the one whose name begins with `game`).
+/// What to tell when the executable is not the retail build that the 1440p
+/// and DLSS patches know: often it is that build, changed in place by
+/// another tool (an FPS unlock changed 6 bytes and kept the stock file as
+/// `.exe.bak`: issue #6 of the public repository). A file beside it whose
+/// name begins as the executable's, of the same size, that hashes to the
+/// retail build is named.
+fn changed_copy(exe: &Path) -> String {
+    let len = std::fs::metadata(exe).map_or(0, |m| m.len());
+    let stem = exe.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let stock = exe
+        .parent()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.as_path() != exe
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().starts_with(&stem))
+                && std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() == len)
+        })
+        .find(|p| std::fs::read(p).is_ok_and(|bytes| blake3::hash(&bytes).to_hex().as_str() == native_1440p::RETAIL_BUILD));
+    match stock {
+        Some(stock) => format!(
+            "{} is not the unchanged retail executable: it was changed in place (for example by an FPS patch). The unchanged one is {}: copy it back over the changed one, or choose the 1080p class or DLSS off. (For more than 30 fps use the launcher's frame-rate setting.)",
+            exe.display(),
+            stock.display()
+        ),
+        None => format!(
+            "{} is not the unchanged retail executable of version 1.0.2.1 (another build, or changed in place, for example by an FPS patch). 1440p output and DLSS need the unchanged file: restore it, or choose the 1080p class or DLSS off.",
+            exe.display()
+        ),
+    }
+}
+
+fn title_executable(given: &Path) -> Result<std::path::PathBuf> {
+    if !given.is_dir() {
+        anyhow::ensure!(given.exists(), "{} does not exist: give the title's executable, or the folder it is in", given.display());
+        return Ok(given.to_path_buf());
+    }
+    let mut exes: Vec<std::path::PathBuf> = std::fs::read_dir(given)
+        .with_context(|| format!("listing {}", given.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")))
+        .collect();
+    exes.sort();
+    let game = |p: &std::path::PathBuf| {
+        p.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("game"))
+    };
+    if exes.len() > 1 && exes.iter().filter(|p| game(p)).count() == 1 {
+        exes.retain(game);
+    }
+    match exes.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => anyhow::bail!(
+            "{} is a folder with no executable in it: give the title's executable, or the folder it is in",
+            given.display()
+        ),
+        _ => anyhow::bail!("{} is a folder with {} executables in it: give the title's own", given.display(), exes.len()),
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -57,7 +122,96 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    let fsr = fsr_4k::FsrPreset::requested()?;
+    // PC AMD FidelityFX upscaler (`VICTORY_FSR=1` or `VICTORY_FSR_4K`, with `VICTORY_FIDELITYFX_DIR`):
+    // arm before `streamline::init` so FSR 3 frame generation sees the active host upscaler.
+    let fsr_4k_preset = fsr_4k::FsrPreset::requested()?;
+    let fsr_wanted = std::env::var_os("VICTORY_FSR").is_some_and(|v| v == "1") || fsr_4k_preset.is_some();
+    if fsr_wanted
+        && let Some(dir) = std::env::var_os("VICTORY_FIDELITYFX_DIR").filter(|v| !v.is_empty())
+    {
+        match victory_hle::modules::fidelityfx::use_host_dir(Path::new(&dir)) {
+            Ok(()) => {
+                if let Some(ver) = victory_hle::modules::fidelityfx::version() {
+                    println!(
+                        "upscaler dll   AMD FidelityFX PC upscaler {ver} ({})",
+                        Path::new(&dir).display()
+                    );
+                }
+            }
+            Err(why) => println!("upscaler dll   PC FidelityFX disabled ({why}); using title's own"),
+        }
+    }
+    let fsr_upscaler = victory_hle::modules::fidelityfx::serving();
+    // DLSS / FSR / frame generation (`VICTORY_DLSS`, `VICTORY_FSR`, `VICTORY_FRAMEGEN`,
+    // `VICTORY_FSR_FRAMEGEN`): Streamline / FSR 3 is loaded before anything of the title
+    // or the host GPU, and fails soft; only if one runs does the title render through its
+    // FidelityFX path (`native_1440p::prepare_upscaler` or `fsr_4k::prepare_fsr_4k`).
+    let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+    asked.series_s = matches!(console, Console::SeriesS);
+    let available = victory_hle::streamline::init(&asked);
+    // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_FSR_MODE / VICTORY_DLSS_MODE's
+    // scale with its own FidelityFX upscaling (no Streamline).
+    let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
+    // (FSR 3 frame generation reads the upscaling's inputs as DLSS Frame
+    // Generation does: the title renders through its FidelityFX path too.)
+    let upscaler = (available.dlss
+        || available.framegen
+        || available.fsr_framegen
+        || fsr_upscaler
+        || fsr_path)
+        .then_some(asked.mode);
+    // What this card does for frame generation (also on the picture for the first seconds).
+    for (i, line) in victory_hle::streamline::notice_at_start().iter().enumerate() {
+        println!("{}{line}", if i == 0 { "frame gen      " } else { "               " });
+    }
+    if fsr_path && !asked.any() && !fsr_upscaler {
+        println!(
+            "upscaling      the title's own FidelityFX at the {} scale (VICTORY_FSR_PATH=1)",
+            asked.mode.name()
+        );
+    }
+    if fsr_upscaler {
+        let ver = victory_hle::modules::fidelityfx::version().unwrap_or("FSR");
+        println!(
+            "upscaling      AMD FidelityFX {ver} {}, FSR 3 frame generation {}{}",
+            asked.mode.name(),
+            if available.fsr_framegen {
+                "on"
+            } else if asked.fsr_framegen {
+                "asked, not available"
+            } else {
+                "off"
+            },
+            upscaler
+                .map(|m| format!(", scene at the {} scale ({})", m.name(), m.scale()))
+                .unwrap_or_default()
+        );
+    } else if asked.any() || asked.fsr_framegen {
+        println!(
+            "upscaling      DLSS {}, frame generation {}{}",
+            if available.dlss {
+                "on"
+            } else if asked.dlss {
+                "asked, not available"
+            } else {
+                "off"
+            },
+            if available.framegen || available.fsr_framegen {
+                "on"
+            } else if asked.framegen || asked.fsr_framegen {
+                "asked, not available"
+            } else {
+                "off"
+            },
+            upscaler
+                .map(|m| format!(", scene at the {} scale ({})", m.name(), m.scale()))
+                .unwrap_or_default()
+        );
+    }
+    // A folder in place of the executable: the title's executable in it (reading a folder
+    // as a file fails with "Access is denied", which says nothing of the mistake).
+    let found = title_executable(exe)?;
+    let exe = found.as_path();
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -66,26 +220,82 @@ pub fn run(
         None => println!("build          unknown ({hash})"),
     }
 
-    let images = cfg.cache_subdir("images")?;
-    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = if let Some(preset) = fsr {
-        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
+    // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
+    // patched image goes to a folder of its own, beside the stock one.
+    let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
+    let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
+    let asked_output = victory_loader::resolution::asked_output();
+    let images = if let Some(preset) = fsr_4k_preset {
+        anyhow::ensure!(
+            matches!(console, Console::SeriesX),
+            "VICTORY_FSR_4K needs the Series X profile"
+        );
         fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
-        let dir = cfg.fidelityfx_dir.as_deref().context(
-            "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
-        )?;
-        // Select the provider before the first lookup builds the import registry.
-        victory_hle::modules::fidelityfx::use_host_dir(dir)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("loading the PC FSR upscaler from {}", dir.display()))?;
-        // SAFETY: Windows supports setting the environment across threads.
-        // No title code has run or queried DXGI yet.
-        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
-        let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
-        victory_loader::load(&prepared, &cache)?
+        let [rw, rh] = preset.render_size();
+        println!(
+            "display        3840x2160 SDR, scene {rw}x{rh} through FidelityFX 4K ({})",
+            preset.name()
+        );
+        cfg.cache_subdir(&format!("images/fsr-4k-{}", preset.name()))?
+    } else if native_1440p {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
+        if upscaler.is_some() && render_1080p {
+            println!("display        VICTORY_RENDER_1080P is left out: VICTORY_DLSS_MODE sets the scene's size");
+        }
+        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())
+            .map_err(|e| if victory_game::identify(&hash).is_some() { e } else { e.context(changed_copy(exe)) })?;
+        // SAFETY: nothing else runs yet; the title and the display mode list
+        // read these later.
+        unsafe {
+            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
+            std::env::set_var("VICTORY_NATIVE_1440P", "1");
+        }
+        match upscaler.map(|mode| (mode, native_1440p::prepare_upscaler(&mut prepared, mode))) {
+            Some((mode, Ok(()))) => {
+                let [rw, rh] = mode.render_size([native_1440p::WIDTH, native_1440p::HEIGHT]);
+                println!(
+                    "display        {}x{} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
+                    native_1440p::WIDTH,
+                    native_1440p::HEIGHT,
+                    mode.name()
+                );
+                cfg.cache_subdir(&format!("images/native-1440p-upscaler-{}-sdr", mode.name()))?
+            }
+            other => {
+                if let Some((_, Err(e))) = other {
+                    println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
+                }
+                println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
+                cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+            }
+        }
+    } else if let Some(mode) = upscaler {
+        let label = asked_output
+            .map(|(w, h)| format!("{w}x{h}"))
+            .unwrap_or_else(|| "the title's output".to_owned());
+        match native_1440p::prepare_upscaler(&mut prepared, mode) {
+            Ok(()) => {
+                println!(
+                    "display        {label}, scene at {} of it through FidelityFX ({})",
+                    mode.scale(),
+                    mode.name()
+                );
+                let sub = match asked_output {
+                    Some((w, h)) => format!("images/{w}x{h}-upscaler-{}", mode.name()),
+                    None => format!("images/upscaler-{}", mode.name()),
+                };
+                cfg.cache_subdir(&sub)?
+            }
+            Err(e) => {
+                println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
+                cfg.cache_subdir("images")?
+            }
+        }
     } else {
-        victory_loader::load(&prepared, &images)?
+        cfg.cache_subdir("images")?
     };
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
@@ -122,6 +332,12 @@ pub fn run(
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
+    // The F1 menu's save sharing, and an import it staged put in place before the title runs.
+    if let Some(data) = storage.parent()
+        && let Some(line) = victory_hle::save_share::start(data, title_dir)
+    {
+        println!("saves          {line}");
+    }
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
@@ -151,7 +367,7 @@ pub fn run(
         );
         println!("missing dlls   {message}");
         // None of their imports can be bound, so the title stops at its first
-        // call into one (Grand Theft Auto VI 1.0.2.1 at +0x2237178 during
+        // call into one (the game, build 1.0.2.1, at +0x2237178 during
         // System Init, #930) with nothing saying why. Stubs only if asked for.
         if execute && matches!(unimplemented, Unimplemented::Trap) {
             anyhow::bail!(
@@ -168,6 +384,10 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    // The title's Bink exports go through the movie skipper when
+    // VICTORY_SKIP_BINK asks for it (bound as before otherwise); beneath
+    // the FidelityFX interposer, which only looks at its own DLL.
+    let with_dlls = victory_hle::modules::bink::SkipMovies { inner: &with_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -184,24 +404,17 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // The title's FidelityFX calls go through ours when DLSS or frame
+    // generation is on (bound as before otherwise).
+    let interposed = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
-        unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
-    }
-    // Renderer port #2 (VICTORY_PORT_DESCRIPTORS=1): the title's stores of
-    // descriptor records tell the layer their slots.
-    #[cfg(windows)]
-    if execute && victory_hle::port_descriptors::on() {
-        use victory_loader::descriptor_sites::{Hooked, SITES, apply};
-        let size = image.info().size_of_image as usize;
-        // SAFETY: the image stays mapped, nothing of it has run yet, and the
-        // marks are a static.
-        let done = unsafe { apply(image.base(), size, victory_hle::port_descriptors::marks_address(), &SITES) };
-        let patched = done.iter().filter(|d| **d == Hooked::Done).count();
-        println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
-        victory_hle::port_descriptors::hooked(image.base(), size, patched);
+        unsafe {
+            victory_loader::write_sites::apply_asked(&image_name, image.base(), size);
+            victory_loader::resolution::apply_asked(image.base(), size);
+        }
     }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
     // clock ticks at that interval (victory-gpu), and the title is given
@@ -226,20 +439,11 @@ pub fn run(
             None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
         }
     }
-    // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
-    // VICTORY_UPSCALER; each off without it).
-    #[cfg(windows)]
-    if execute && fsr.is_none() {
-        let size = image.info().size_of_image as usize;
-        // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
-    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
     victory_loader::report_crashes();
-    victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
@@ -260,7 +464,6 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
-    victory_hle::known_pipelines::flush();
     println!("title exited with {code}");
     Ok(())
 }
@@ -304,7 +507,7 @@ fn watch(base: usize, size: usize) {
     let rvas: Vec<usize> = list
         .split(',')
         .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
+        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
         .collect();
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
@@ -364,7 +567,7 @@ fn timers(base: usize, size: usize) {
 
 /// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
 /// each title+rva twice a second. A title that ends itself when its main
-/// loop has not ticked for a while (Grand Theft Auto VI: 30 s) runs on
+/// loop has not ticked for a while (the game: 30 s) runs on
 /// through slower frames with its tick flag poked. The address must be
 /// writable title data.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -464,6 +667,9 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
+                // As at startup: Bink imports of DLLs loaded later too
+                // (VICTORY_SKIP_BINK; bound as before otherwise).
+                let resolver = victory_hle::modules::bink::SkipMovies { inner: &resolver };
                 for (name, dll) in &new {
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",

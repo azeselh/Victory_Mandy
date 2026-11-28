@@ -27,7 +27,6 @@ pub mod structure;
 /// translates again what an earlier build of the translator cached and says
 /// how many came out different: if any did, the bump was due.
 pub const TRANSLATOR_VERSION: u32 = 2;
-
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{

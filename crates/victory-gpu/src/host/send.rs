@@ -184,8 +184,6 @@ struct Copy {
 pub(super) struct Own {
     memory: Memory,
     copies: Vec<Copy>,
-    /// Bytes of memory used.
-    used: u64,
 }
 
 /// Runs whose pairs are one piece of work.
@@ -196,61 +194,43 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let began = std::time::Instant::now();
     pass(host)?;
     // Runs of whole words of the copy: only those are pairs. (A byte beside
-    // them in a word may be the card's.) Single-pass partition so we don't
-    // scan `dirty` three times or re-evaluate `short`.
+    // them in a word may be the card's.)
+    let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    let mut short_groups: Vec<(usize, Vec<(usize, usize)>, u64)> = Vec::new();
-    for (shadow, ranges) in dirty {
+    for (_, ranges) in dirty {
         let mut runs = Vec::new();
-        let mut cur_short = Vec::new();
-        let mut cur_words = 0usize;
-        let mut total_words = 0usize;
-        let start_group = short_groups.len();
-        let from = shadow.card_data() as usize;
-        for &(a, b) in ranges {
-            let len = b - a;
-            if short(a, len) {
-                cur_words += len / 4;
-                total_words += len / 4;
-                cur_short.push((a, b));
-                if cur_short.len() == RUNS_AT_A_TIME {
-                    let taken_short = std::mem::take(&mut cur_short);
-                    let rel_at = (total_words - cur_words) as u64 * 8;
-                    short_groups.push((from, taken_short, rel_at));
-                    cur_words = 0;
-                }
-            } else {
-                runs.push((a, at, len));
-                at += (len as u64).next_multiple_of(16);
-            }
+        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
+            runs.push((a, at, b - a));
+            at += ((b - a) as u64).next_multiple_of(16);
         }
-        let pairs_base = at;
-        for g in &mut short_groups[start_group..] {
-            g.2 += pairs_base;
-        }
-        if cur_words > 0 {
-            let rel_at = (total_words - cur_words) as u64 * 8;
-            short_groups.push((from, cur_short, pairs_base + rel_at));
-        }
-        copies.push(Copy { runs, pairs: (pairs_base, total_words as u32) });
-        at += (total_words as u64 * 8).next_multiple_of(16);
+        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        copies.push(Copy { runs, pairs: (at, words as u32) });
+        at += (words as u64 * 8).next_multiple_of(16);
     }
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    for ((shadow, _), copy) in dirty.iter().zip(&copies) {
-        if !copy.runs.is_empty() {
-            let from = shadow.card_data() as usize;
-            moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
+    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
+        let from = shadow.card_data() as usize;
+        moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+        // (80,000 runs of some words a frame: in pieces of work.)
+        let mut to = memory.data + copy.pairs.0 as usize;
+        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
+            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+            if words > 0 {
+                work.push((from, ranges, to));
+                to += words * 8;
+            }
         }
     }
     let one = |i: usize| {
-        let (from, ref ranges, group_at) = short_groups[i];
-        let mut to = (memory.data + group_at as usize) as *mut [u32; 2];
-        for &(a, b) in ranges {
+        let (from, ranges, to) = work[i];
+        let mut to = to as *mut [u32; 2];
+        for &(a, b) in ranges.iter().filter(|r| short(r)) {
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these
@@ -264,13 +244,13 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             }
         }
     };
-    crate::land::each_under(short_groups.len(), &one);
+    crate::land::each_under(work.len(), &one);
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
     crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Some(Own { memory, copies, used: at })
+    Some(Own { memory, copies })
 }
 
 impl Own {
@@ -286,10 +266,7 @@ impl Own {
         list: &ID3D12GraphicsCommandList,
         dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
         looked: impl Fn(&Shadow) -> bool,
-        from: Option<&ID3D12Resource>,
     ) {
-        // (With `crate::host::upq`: a copy of the memory in the card's.)
-        let source = from.unwrap_or(&self.memory.buffer);
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -297,7 +274,7 @@ impl Own {
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
                 // SAFETY: the caller's; live buffers, ranges inside them.
-                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
+                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
             if copy.pairs.1 > 0 {
@@ -324,7 +301,7 @@ impl Own {
             {
                 list.SetComputeRootSignature(&pass.root);
                 list.SetPipelineState(&pass.pso);
-                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
+                list.SetComputeRootShaderResourceView(1, self.memory.buffer.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
@@ -343,11 +320,6 @@ impl Own {
                 list.ResourceBarrier(&last);
             }
         }
-    }
-
-    /// The memory and the bytes of it used.
-    pub(super) fn source(&self) -> (&ID3D12Resource, u64) {
-        (&self.memory.buffer, self.used)
     }
 
     /// The memory, to be kept until the submission has run.
