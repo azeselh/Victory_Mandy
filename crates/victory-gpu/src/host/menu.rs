@@ -120,7 +120,7 @@ const ABOUT_S_RES: [&str; 3] = [
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
 /// The last line of the box: where this build comes from.
-const REPO: &str = "GITHUB.COM/AZESELH/VICTORY-FORK";
+const REPO: &str = "GITHUB.COM/AZESELH/VICTORY-MANDY";
 const RIM: u32 = 4;
 const UPLOADS: usize = 4;
 
@@ -171,13 +171,13 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_CARD_STEPS", label: "CARD STEPS", values: STAGES, live: false },
     Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
     Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: "CARD COMPARES FROM (KB)", values: &[("64", "64"), ("1024", "1024")], live: false },
-    Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: ON_UNSET, live: false },
     // THIN records the title's list calls on our threads. On an RTX 5080 with a 6-core CPU heads did not
     // draw with it and frames were slower (14 a second with it, 21 to 28 without): switches for it and for
     // what goes with it. Frame generation needs the line of submissions: without THIN, ASYNC SUBMIT gives it.
-    Item { var: "VICTORY_THIN", label: "THIN LISTS (HEADS MAY BE MISSING)", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_THIN", label: "THIN LISTS (HEADS MAY BE MISSING)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_JOIN_PARTS", label: "JOIN PARTS", values: &[("8", "8"), ("", "1 (OFF)")], live: false },
-    Item { var: "VICTORY_ASYNC_SUBMIT", label: "ASYNC SUBMIT (FRAME GEN WITHOUT THIN)", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_ASYNC_SUBMIT", label: "ASYNC SUBMIT (FRAME GEN WITHOUT THIN)", values: ON_UNSET, live: false },
 ];
 /// The lines after the settings.
 const ACTIONS: [&str; 7] = [

@@ -43,8 +43,9 @@ const FSR_FILES: [&str; 3] = [
 
 /// The settings the title is started with.
 const SETTINGS: &[(&str, &str)] = &[
-    // Submission and copy machinery
-    ("VICTORY_THIN", "1"),
+    // Submission and copy machinery (ASYNC_SUBMIT keeps FrameGen's submission line without THIN stall)
+    ("VICTORY_THIN", "0"),
+    ("VICTORY_ASYNC_SUBMIT", "1"),
     ("VICTORY_JOIN_PARTS", "8"),
     ("VICTORY_RELAY", "2"),
     ("VICTORY_RELAY_COPY", "1"),
@@ -59,6 +60,14 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_UPLOAD_AHEAD", "1"),
     ("VICTORY_SHOW_AFTER", "1"),
     ("VICTORY_MAP_THREADS", "1"),
+    // Renderer Ports 1, 2, 5, 6, 7 & residency safety (measured ~3.9x higher FPS on i5-13400F + RX 7900 XT)
+    ("VICTORY_PORT_CONSTANTS", "1"),
+    ("VICTORY_PORT_DESCRIPTORS", "1"),
+    ("VICTORY_PORT_CBV", "1"),
+    ("VICTORY_PORT_GUARD", "1"),
+    ("VICTORY_PORT_JOURNAL", "1"),
+    ("VICTORY_RESIDENCY", "1"),
+    ("VICTORY_SWEEP_PER_HEAP", "1"),
     // A frame's texture passes within 8 ms together; helpers woken at each submission's start
     ("VICTORY_TEXSPK_PASS_MS", "8"),
     ("VICTORY_PASSES_HOT", "1"),
